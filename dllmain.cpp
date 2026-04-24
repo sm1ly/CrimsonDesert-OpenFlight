@@ -21,7 +21,7 @@ static uintptr_t g_PlayerContext = 0;
 static int g_AscendKey = VK_NUMPAD9;
 static int g_DescendKey = VK_NUMPAD8;
 static int g_ForwardKey = VK_LSHIFT;
-static float g_AscendSpeed = 3.0f; // Увеличили скорости, так как теперь это абсолютное значение, а не добавка
+static float g_AscendSpeed = 3.0f;
 static float g_DescendSpeed = -3.0f;
 static float g_ForwardSpeed = 8.0f; 
 
@@ -148,8 +148,9 @@ static DWORD WINAPI KeyPollThread(LPVOID) {
 
             if (GetAsyncKeyState(g_ForwardKey) & 0x8000) {
                 if (g_PlayerContext && !IsBadReadPtr((void*)g_PlayerContext, 0x100)) {
-                    float fwdX = *(float*)(g_PlayerContext + 0x60);
-                    float fwdZ = *(float*)(g_PlayerContext + 0x68);
+                    // Используем +0x7C и +0x80 для вектора ВПЕРЕД (а не влево как было на +0x60)
+                    float fwdX = *(float*)(g_PlayerContext + 0x7C);
+                    float fwdZ = *(float*)(g_PlayerContext + 0x80);
                     g_BoostVec[0] = fwdX * g_ForwardSpeed;
                     g_BoostVec[2] = fwdZ * g_ForwardSpeed;
                     active = true;
