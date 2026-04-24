@@ -21,9 +21,9 @@ static uintptr_t g_PlayerContext = 0;
 static int g_AscendKey = VK_NUMPAD9;
 static int g_DescendKey = VK_NUMPAD8;
 static int g_ForwardKey = VK_LSHIFT;
-static float g_AscendSpeed = 2.0f;
-static float g_DescendSpeed = -2.0f;
-static float g_ForwardSpeed = 3.0f;
+static float g_AscendSpeed = 4.0f;
+static float g_DescendSpeed = -4.0f;
+static float g_ForwardSpeed = 8.0f; // Возвращаем нормальную скорость полета
 
 static void WriteLog(const char* msg) {
     HANDLE h = CreateFileA("CDFlight_Context.log", FILE_APPEND_DATA, FILE_SHARE_READ,
@@ -96,13 +96,13 @@ static void LoadConfig() {
     g_ForwardKey = GetPrivateProfileIntA("Settings", "ForwardKey", VK_LSHIFT, iniPath.c_str());
     
     char buf[32];
-    GetPrivateProfileStringA("Settings", "AscendSpeed", "2.0", buf, sizeof(buf), iniPath.c_str());
+    GetPrivateProfileStringA("Settings", "AscendSpeed", "4.0", buf, sizeof(buf), iniPath.c_str());
     g_AscendSpeed = std::stof(buf);
     
-    GetPrivateProfileStringA("Settings", "DescendSpeed", "-2.0", buf, sizeof(buf), iniPath.c_str());
+    GetPrivateProfileStringA("Settings", "DescendSpeed", "-4.0", buf, sizeof(buf), iniPath.c_str());
     g_DescendSpeed = std::stof(buf);
 
-    GetPrivateProfileStringA("Settings", "ForwardSpeed", "3.0", buf, sizeof(buf), iniPath.c_str());
+    GetPrivateProfileStringA("Settings", "ForwardSpeed", "8.0", buf, sizeof(buf), iniPath.c_str());
     g_ForwardSpeed = std::stof(buf);
 }
 
@@ -132,20 +132,12 @@ static DWORD WINAPI ScannerThread(LPVOID) {
 }
 
 static DWORD WINAPI KeyPollThread(LPVOID) {
-    float targetX = 0.0f;
-    float targetY = 0.0f;
-    float targetZ = 0.0f;
-    
-    // Smooth damping multiplier (0.0 to 1.0)
-    // 0.1 means it loses 10% of the difference per 10ms tick.
-    const float damping = 0.05f; 
-
     while (true) {
         if (IsGameForeground()) {
             bool active = false;
-            targetX = 0.0f;
-            targetY = 0.0f;
-            targetZ = 0.0f;
+            float targetX = 0.0f;
+            float targetY = 0.0f;
+            float targetZ = 0.0f;
 
             if (GetAsyncKeyState(g_AscendKey) & 0x8000) {
                 targetY = g_AscendSpeed;
@@ -165,26 +157,16 @@ static DWORD WINAPI KeyPollThread(LPVOID) {
                 }
             }
 
-            // --- INERTIA DAMPING ---
-            // Move g_BoostVec smoothly towards the target vectors
-            g_BoostVec[0] += (targetX - g_BoostVec[0]) * damping;
-            g_BoostVec[1] += (targetY - g_BoostVec[1]) * damping;
-            g_BoostVec[2] += (targetZ - g_BoostVec[2]) * damping;
-
-            // Keep it active as long as we are still gliding to a halt
-            if (active || abs(g_BoostVec[0]) > 0.05f || abs(g_BoostVec[1]) > 0.05f || abs(g_BoostVec[2]) > 0.05f) {
+            if (active) {
+                g_BoostVec[0] = targetX;
+                g_BoostVec[1] = targetY;
+                g_BoostVec[2] = targetZ;
                 g_BoostActive = 1;
             } else {
                 g_BoostActive = 0;
-                g_BoostVec[0] = 0.0f;
-                g_BoostVec[1] = 0.0f;
-                g_BoostVec[2] = 0.0f;
             }
         } else {
             g_BoostActive = 0;
-            g_BoostVec[0] = 0.0f;
-            g_BoostVec[1] = 0.0f;
-            g_BoostVec[2] = 0.0f;
         }
         Sleep(10);
     }
@@ -236,13 +218,19 @@ static bool InstallPatch() {
     *reinterpret_cast<uint64_t*>(p) = reinterpret_cast<uint64_t>(&g_BoostActive); p += 8;
     
     *p++ = 0x83; *p++ = 0x38; *p++ = 0x00; // cmp dword ptr [rax], 0
-    *p++ = 0x74; *p++ = 0x0D; // je skip
+    *p++ = 0x74; *p++ = 0x17; // je skip (23 bytes forward)
 
-    // Add boost to xmm0 (safe addition)
-    *p++ = 0x48; *p++ = 0xB8; // mov rax, &g_BoostVec
+    // --- MAGIC BLENDPS OVERWRITE ---
+    // This solves EVERYTHING: No stack crash, no W-component floor fall, no velocity buildup!
+    // mov rax, &g_BoostVec
+    *p++ = 0x48; *p++ = 0xB8;
     *reinterpret_cast<uint64_t*>(p) = reinterpret_cast<uint64_t>(&g_BoostVec[0]); p += 8;
     
-    *p++ = 0x0F; *p++ = 0x58; *p++ = 0x00; // addps xmm0, [rax]
+    // movups xmm1, [rax]
+    *p++ = 0x0F; *p++ = 0x10; *p++ = 0x08;
+
+    // blendps xmm0, xmm1, 7 (0111b = overwrite X, Y, Z, keep W)
+    *p++ = 0x66; *p++ = 0x0F; *p++ = 0x3A; *p++ = 0x04; *p++ = 0xC1; *p++ = 0x07;
 
     // skip:
     *p++ = 0x58; // pop rax
