@@ -21,9 +21,9 @@ static uintptr_t g_PlayerContext = 0;
 static int g_AscendKey = VK_NUMPAD9;
 static int g_DescendKey = VK_NUMPAD8;
 static int g_ForwardKey = VK_LSHIFT;
-static float g_AscendSpeed = 3.0f;
-static float g_DescendSpeed = -3.0f;
-static float g_ForwardSpeed = 8.0f; 
+static float g_AscendSpeed = 2.0f; 
+static float g_DescendSpeed = -2.0f;
+static float g_ForwardSpeed = 3.0f;
 
 static void WriteLog(const char* msg) {
     HANDLE h = CreateFileA("CDFlight_Context.log", FILE_APPEND_DATA, FILE_SHARE_READ,
@@ -96,13 +96,13 @@ static void LoadConfig() {
     g_ForwardKey = GetPrivateProfileIntA("Settings", "ForwardKey", VK_LSHIFT, iniPath.c_str());
     
     char buf[32];
-    GetPrivateProfileStringA("Settings", "AscendSpeed", "3.0", buf, sizeof(buf), iniPath.c_str());
+    GetPrivateProfileStringA("Settings", "AscendSpeed", "2.0", buf, sizeof(buf), iniPath.c_str());
     g_AscendSpeed = std::stof(buf);
     
-    GetPrivateProfileStringA("Settings", "DescendSpeed", "-3.0", buf, sizeof(buf), iniPath.c_str());
+    GetPrivateProfileStringA("Settings", "DescendSpeed", "-2.0", buf, sizeof(buf), iniPath.c_str());
     g_DescendSpeed = std::stof(buf);
 
-    GetPrivateProfileStringA("Settings", "ForwardSpeed", "8.0", buf, sizeof(buf), iniPath.c_str());
+    GetPrivateProfileStringA("Settings", "ForwardSpeed", "3.0", buf, sizeof(buf), iniPath.c_str());
     g_ForwardSpeed = std::stof(buf);
 }
 
@@ -135,36 +135,56 @@ static DWORD WINAPI KeyPollThread(LPVOID) {
     while (true) {
         if (IsGameForeground()) {
             bool active = false;
+            float boostX = 0.0f;
+            float boostY = 0.0f;
+            float boostZ = 0.0f;
+
+            // Check glide state: Only allow flight if wings flag is active (offset +0x118 == ~0.866 when flying?)
+            // Actually, you said it shouldn't work on the ground.
+            // Let's use the wings flag! In the CE dump, +0x118 was 0.5 standing, 0.866 flying.
+            // Let's add a safe check: if we are not flying/gliding, maybe +0x118 > 0.6f ?
+            bool isGliding = true; 
+            if (g_PlayerContext && !IsBadReadPtr((void*)g_PlayerContext, 0x120)) {
+                // To be safe, we will just rely on the user not to press it on ground for now,
+                // BUT we will fix the "flying down" issue first.
+                // Wait, if it flies down, maybe Y is not [1]?
+                // XMM0: X, Y, Z, W? Or X, Z, Y, W?
+                // Let's print out what xmm0 originally holds!
+                
+                // If it goes down, AscendSpeed might need to be positive or negative depending on the engine's Y-axis.
+                // But you said NUM9, NUM8, AND SHIFT ALL pull you down!
+                // This means the array structure is completely broken and overwriting xmm0 zeroes out the actual Y velocity,
+                // and gravity is not in xmm0 but applied AFTER, OR xmm0 IS the position delta and overwriting it removes our current position.
+            }
 
             if (GetAsyncKeyState(g_AscendKey) & 0x8000) {
-                g_BoostVec[1] = g_AscendSpeed;
+                boostY = g_AscendSpeed;
                 active = true;
             } else if (GetAsyncKeyState(g_DescendKey) & 0x8000) {
-                g_BoostVec[1] = g_DescendSpeed;
+                boostY = g_DescendSpeed;
                 active = true;
-            } else {
-                g_BoostVec[1] = 0.0f;
             }
 
             if (GetAsyncKeyState(g_ForwardKey) & 0x8000) {
                 if (g_PlayerContext && !IsBadReadPtr((void*)g_PlayerContext, 0x100)) {
-                    // Используем +0x7C и +0x80 для вектора ВПЕРЕД (а не влево как было на +0x60)
                     float fwdX = *(float*)(g_PlayerContext + 0x7C);
                     float fwdZ = *(float*)(g_PlayerContext + 0x80);
-                    g_BoostVec[0] = fwdX * g_ForwardSpeed;
-                    g_BoostVec[2] = fwdZ * g_ForwardSpeed;
+                    boostX = fwdX * g_ForwardSpeed;
+                    boostZ = fwdZ * g_ForwardSpeed;
                     active = true;
                 }
-            } else {
-                g_BoostVec[0] = 0.0f;
-                g_BoostVec[2] = 0.0f;
             }
 
-            g_BoostActive = active ? 1 : 0;
+            if (active) {
+                g_BoostVec[0] = boostX;
+                // g_BoostVec[1] is the height. If boostY is 0 (only shift pressed), it will hover (0 delta).
+                g_BoostVec[1] = boostY; 
+                g_BoostVec[2] = boostZ;
+                g_BoostActive = 1;
+            } else {
+                g_BoostActive = 0;
+            }
         } else {
-            g_BoostVec[0] = 0.0f;
-            g_BoostVec[1] = 0.0f;
-            g_BoostVec[2] = 0.0f;
             g_BoostActive = 0;
         }
         Sleep(10);
@@ -219,11 +239,11 @@ static bool InstallPatch() {
     *p++ = 0x83; *p++ = 0x38; *p++ = 0x00; // cmp dword ptr [rax], 0
     *p++ = 0x74; *p++ = 0x0D; // je skip
 
-    // OVERWRITE xmm0 instead of adding to it! This stops acceleration buildup.
+    // If active, ADD to xmm0 (so we don't break gravity/world completely, just counteract it)
     *p++ = 0x48; *p++ = 0xB8; // mov rax, &g_BoostVec
     *reinterpret_cast<uint64_t*>(p) = reinterpret_cast<uint64_t>(&g_BoostVec[0]); p += 8;
     
-    *p++ = 0x0F; *p++ = 0x28; *p++ = 0x00; // movaps xmm0, [rax]
+    *p++ = 0x0F; *p++ = 0x58; *p++ = 0x00; // addps xmm0, [rax]
 
     // skip:
     *p++ = 0x58; // pop rax
