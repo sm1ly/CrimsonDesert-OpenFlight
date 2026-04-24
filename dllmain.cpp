@@ -21,9 +21,19 @@ static uintptr_t g_PlayerContext = 0;
 static int g_AscendKey = VK_NUMPAD9;
 static int g_DescendKey = VK_NUMPAD8;
 static int g_ForwardKey = VK_LSHIFT;
-static float g_AscendSpeed = 1.5f;
-static float g_DescendSpeed = -1.5f;
-static float g_ForwardSpeed = 2.0f;
+static float g_AscendSpeed = 3.0f; // Увеличили скорости, так как теперь это абсолютное значение, а не добавка
+static float g_DescendSpeed = -3.0f;
+static float g_ForwardSpeed = 8.0f; 
+
+static void WriteLog(const char* msg) {
+    HANDLE h = CreateFileA("CDFlight_Context.log", FILE_APPEND_DATA, FILE_SHARE_READ,
+        nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return;
+    DWORD wrote = 0;
+    WriteFile(h, msg, (DWORD)strlen(msg), &wrote, nullptr);
+    WriteFile(h, "\r\n", 2, &wrote, nullptr);
+    CloseHandle(h);
+}
 
 static bool IsGameForeground() {
     HWND hwnd = GetForegroundWindow();
@@ -31,6 +41,45 @@ static bool IsGameForeground() {
     DWORD pid = 0;
     GetWindowThreadProcessId(hwnd, &pid);
     return pid == GetCurrentProcessId();
+}
+
+static uintptr_t FindUserActorPtr() {
+    HMODULE hGame = GetModuleHandleA(nullptr);
+    if (!hGame) return 0;
+    PIMAGE_DOS_HEADER dos = (PIMAGE_DOS_HEADER)hGame;
+    PIMAGE_NT_HEADERS nt = (PIMAGE_NT_HEADERS)((uint8_t*)hGame + dos->e_lfanew);
+    DWORD size = nt->OptionalHeader.SizeOfImage;
+    uint8_t* base = (uint8_t*)hGame;
+    const char* sig = "\x48\x8B\x0D\x00\x00\x00\x00\xE8\x00\x00\x00\x00\x41\xB0\x01\x48\x8B\x53\x08";
+    const char* mask = "xxx????x????xxxxxxx";
+    size_t len = strlen(mask);
+    for (DWORD i = 0; i < size - len; i++) {
+        bool found = true;
+        for (size_t j = 0; j < len; j++) {
+            if (mask[j] != '?' && base[i + j] != (uint8_t)sig[j]) { found = false; break; }
+        }
+        if (found) {
+            uint32_t rel = *(uint32_t*)(base + i + 3);
+            return (uintptr_t)(base + i + 7 + rel);
+        }
+    }
+    return 0;
+}
+
+static uintptr_t GetKliff() {
+    static uintptr_t userActorPtr = 0;
+    if (!userActorPtr) userActorPtr = FindUserActorPtr();
+    if (!userActorPtr || IsBadReadPtr((void*)userActorPtr, 8)) return 0;
+    
+    uintptr_t userActor = *reinterpret_cast<uintptr_t*>(userActorPtr);
+    if (!userActor || IsBadReadPtr((void*)userActor, 0xE0)) return 0;
+    
+    uintptr_t kliff = *reinterpret_cast<uintptr_t*>(userActor + 0xD0);
+    if (kliff == 0xFFFFFFFFFFFFFFFFull || kliff == 0) {
+        kliff = *reinterpret_cast<uintptr_t*>(userActor + 0xD8);
+    }
+    if (kliff == 0xFFFFFFFFFFFFFFFFull) return 0;
+    return kliff;
 }
 
 static void LoadConfig() {
@@ -47,33 +96,35 @@ static void LoadConfig() {
     g_ForwardKey = GetPrivateProfileIntA("Settings", "ForwardKey", VK_LSHIFT, iniPath.c_str());
     
     char buf[32];
-    GetPrivateProfileStringA("Settings", "AscendSpeed", "1.5", buf, sizeof(buf), iniPath.c_str());
+    GetPrivateProfileStringA("Settings", "AscendSpeed", "3.0", buf, sizeof(buf), iniPath.c_str());
     g_AscendSpeed = std::stof(buf);
     
-    GetPrivateProfileStringA("Settings", "DescendSpeed", "-1.5", buf, sizeof(buf), iniPath.c_str());
+    GetPrivateProfileStringA("Settings", "DescendSpeed", "-3.0", buf, sizeof(buf), iniPath.c_str());
     g_DescendSpeed = std::stof(buf);
 
-    GetPrivateProfileStringA("Settings", "ForwardSpeed", "2.0", buf, sizeof(buf), iniPath.c_str());
+    GetPrivateProfileStringA("Settings", "ForwardSpeed", "8.0", buf, sizeof(buf), iniPath.c_str());
     g_ForwardSpeed = std::stof(buf);
 }
 
 static DWORD WINAPI ScannerThread(LPVOID) {
     while (true) {
-        uintptr_t foundCtx = 0;
-        for (int i = 0; i < 1024; i++) {
-            uintptr_t ctx = g_rbxBuffer[i];
-            if (!ctx) continue;
-            // Prevent crashes by checking if memory is readable
-            if (IsBadReadPtr((void*)ctx, 0x200)) continue;
-            
-            // Check for our magic marker FFFFFFFFFFFFFFFF at +0x168
-            if (*(uint64_t*)(ctx + 0x168) == 0xFFFFFFFFFFFFFFFFull) {
-                foundCtx = ctx;
-                break;
+        uintptr_t kliff = GetKliff();
+        if (kliff) {
+            uintptr_t foundCtx = 0;
+            for (int i = 0; i < 1024; i++) {
+                uintptr_t ctx = g_rbxBuffer[i];
+                if (!ctx || IsBadReadPtr((void*)ctx, 0x300)) continue;
+                for (int j = 0; j < 0x300; j += 8) {
+                    if (*(uintptr_t*)(ctx + j) == kliff) {
+                        foundCtx = ctx;
+                        break;
+                    }
+                }
+                if (foundCtx) break;
             }
-        }
-        if (foundCtx) {
-            g_PlayerContext = foundCtx;
+            if (foundCtx) {
+                g_PlayerContext = foundCtx;
+            }
         }
         Sleep(100);
     }
@@ -99,7 +150,6 @@ static DWORD WINAPI KeyPollThread(LPVOID) {
                 if (g_PlayerContext && !IsBadReadPtr((void*)g_PlayerContext, 0x100)) {
                     float fwdX = *(float*)(g_PlayerContext + 0x60);
                     float fwdZ = *(float*)(g_PlayerContext + 0x68);
-                    
                     g_BoostVec[0] = fwdX * g_ForwardSpeed;
                     g_BoostVec[2] = fwdZ * g_ForwardSpeed;
                     active = true;
@@ -140,7 +190,7 @@ static bool InstallPatch() {
 
     uint8_t* p = g_trampoline;
 
-    // --- RING BUFFER CAPTURE (Safe) ---
+    // --- RING BUFFER CAPTURE ---
     *p++ = 0x50; // push rax
     *p++ = 0x51; // push rcx
     *p++ = 0x52; // push rdx
@@ -166,13 +216,13 @@ static bool InstallPatch() {
     *reinterpret_cast<uint64_t*>(p) = reinterpret_cast<uint64_t>(&g_BoostActive); p += 8;
     
     *p++ = 0x83; *p++ = 0x38; *p++ = 0x00; // cmp dword ptr [rax], 0
-    *p++ = 0x74; *p++ = 0x0D; // je skip (13 bytes forward)
+    *p++ = 0x74; *p++ = 0x0D; // je skip
 
-    // Add boost to xmm0
+    // OVERWRITE xmm0 instead of adding to it! This stops acceleration buildup.
     *p++ = 0x48; *p++ = 0xB8; // mov rax, &g_BoostVec
     *reinterpret_cast<uint64_t*>(p) = reinterpret_cast<uint64_t>(&g_BoostVec[0]); p += 8;
     
-    *p++ = 0x0F; *p++ = 0x58; *p++ = 0x00; // addps xmm0, [rax]
+    *p++ = 0x0F; *p++ = 0x28; *p++ = 0x00; // movaps xmm0, [rax]
 
     // skip:
     *p++ = 0x58; // pop rax
@@ -198,6 +248,7 @@ static bool InstallPatch() {
 BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID reserved) {
     if (reason == DLL_PROCESS_ATTACH) {
         DisableThreadLibraryCalls(hModule);
+        DeleteFileA("CDFlight_Context.log");
         LoadConfig();
         CreateThread(nullptr, 0, ScannerThread, nullptr, 0, nullptr);
         CreateThread(nullptr, 0, KeyPollThread, nullptr, 0, nullptr);
