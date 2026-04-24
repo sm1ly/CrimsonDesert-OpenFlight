@@ -12,14 +12,26 @@ static const uint8_t  kExpected[5] = { 0x41, 0x0F, 0x11, 0x45, 0x00 }; // movups
 static uint8_t* g_trampoline = nullptr;
 static uint8_t* g_patchAddr  = nullptr;
 
-// Aligned array for addps instruction (X, Y, Z, W)
 alignas(16) static float g_BoostVec[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
 static volatile int32_t g_BoostActive = 0;
+static uintptr_t g_PlayerContext = 0; // Captured dynamically
 
 static int g_AscendKey = VK_NUMPAD9;
 static int g_DescendKey = VK_NUMPAD8;
+static int g_ForwardKey = VK_LSHIFT;
 static float g_AscendSpeed = 1.5f;
 static float g_DescendSpeed = -1.5f;
+static float g_ForwardSpeed = 2.0f;
+
+static void WriteLog(const char* msg) {
+    HANDLE h = CreateFileA("CDFlight_Context.log", FILE_APPEND_DATA, FILE_SHARE_READ,
+        nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return;
+    DWORD wrote = 0;
+    WriteFile(h, msg, (DWORD)strlen(msg), &wrote, nullptr);
+    WriteFile(h, "\r\n", 2, &wrote, nullptr);
+    CloseHandle(h);
+}
 
 static bool IsGameForeground() {
     HWND hwnd = GetForegroundWindow();
@@ -40,6 +52,7 @@ static void LoadConfig() {
 
     g_AscendKey = GetPrivateProfileIntA("Settings", "AscendKey", VK_NUMPAD9, iniPath.c_str());
     g_DescendKey = GetPrivateProfileIntA("Settings", "DescendKey", VK_NUMPAD8, iniPath.c_str());
+    g_ForwardKey = GetPrivateProfileIntA("Settings", "ForwardKey", VK_LSHIFT, iniPath.c_str());
     
     char buf[32];
     GetPrivateProfileStringA("Settings", "AscendSpeed", "1.5", buf, sizeof(buf), iniPath.c_str());
@@ -47,23 +60,48 @@ static void LoadConfig() {
     
     GetPrivateProfileStringA("Settings", "DescendSpeed", "-1.5", buf, sizeof(buf), iniPath.c_str());
     g_DescendSpeed = std::stof(buf);
+
+    GetPrivateProfileStringA("Settings", "ForwardSpeed", "2.0", buf, sizeof(buf), iniPath.c_str());
+    g_ForwardSpeed = std::stof(buf);
 }
 
 static DWORD WINAPI KeyPollThread(LPVOID) {
     while (true) {
         if (IsGameForeground()) {
+            bool active = false;
+
+            // Vertical flight
             if (GetAsyncKeyState(g_AscendKey) & 0x8000) {
                 g_BoostVec[1] = g_AscendSpeed;
-                g_BoostActive = 1;
+                active = true;
             } else if (GetAsyncKeyState(g_DescendKey) & 0x8000) {
                 g_BoostVec[1] = g_DescendSpeed;
-                g_BoostActive = 1;
+                active = true;
             } else {
                 g_BoostVec[1] = 0.0f;
-                g_BoostActive = 0;
             }
+
+            // Horizontal flight
+            if (GetAsyncKeyState(g_ForwardKey) & 0x8000) {
+                if (g_PlayerContext && !IsBadReadPtr((void*)g_PlayerContext, 0x100)) {
+                    // Vectors found at offset +0x60 (X) and +0x68 (Z)
+                    float fwdX = *(float*)(g_PlayerContext + 0x60);
+                    float fwdZ = *(float*)(g_PlayerContext + 0x68);
+                    
+                    g_BoostVec[0] = fwdX * g_ForwardSpeed;
+                    g_BoostVec[2] = fwdZ * g_ForwardSpeed;
+                    active = true;
+                }
+            } else {
+                g_BoostVec[0] = 0.0f;
+                g_BoostVec[2] = 0.0f;
+            }
+
+            g_BoostActive = active ? 1 : 0;
         } else {
+            g_BoostVec[0] = 0.0f;
             g_BoostVec[1] = 0.0f;
+            g_BoostVec[2] = 0.0f;
             g_BoostActive = 0;
         }
         Sleep(10);
@@ -90,9 +128,23 @@ static bool InstallPatch() {
 
     uint8_t* p = g_trampoline;
 
-    // Check if boost is active
     *p++ = 0x50; // push rax
-    
+
+    // Capture player context logic: cmp [rbx + 0x168], -1
+    // mov rax, [rbx + 0x168]
+    *p++ = 0x48; *p++ = 0x8B; *p++ = 0x83; *p++ = 0x68; *p++ = 0x01; *p++ = 0x00; *p++ = 0x00;
+    // cmp rax, -1
+    *p++ = 0x48; *p++ = 0x83; *p++ = 0xF8; *p++ = 0xFF;
+    // jne skip_capture (10 bytes)
+    *p++ = 0x75; *p++ = 0x0A;
+    // mov rax, &g_PlayerContext
+    *p++ = 0x48; *p++ = 0xB8;
+    *reinterpret_cast<uint64_t*>(p) = reinterpret_cast<uint64_t>(&g_PlayerContext); p += 8;
+    // mov [rax], rbx
+    *p++ = 0x48; *p++ = 0x89; *p++ = 0x18;
+    // skip_capture:
+
+    // Check if boost is active
     *p++ = 0x48; *p++ = 0xB8; // mov rax, &g_BoostActive
     *reinterpret_cast<uint64_t*>(p) = reinterpret_cast<uint64_t>(&g_BoostActive); p += 8;
     
