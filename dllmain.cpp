@@ -135,37 +135,54 @@ static DWORD WINAPI KeyPollThread(LPVOID) {
     while (true) {
         if (IsGameForeground()) {
             bool active = false;
+            float boostX = 0.0f;
+            float boostY = 0.0f;
+            float boostZ = 0.0f;
 
             if (GetAsyncKeyState(g_AscendKey) & 0x8000) {
-                g_BoostVec[1] = g_AscendSpeed;
+                boostY = g_AscendSpeed;
                 active = true;
             } else if (GetAsyncKeyState(g_DescendKey) & 0x8000) {
-                g_BoostVec[1] = g_DescendSpeed;
+                boostY = g_DescendSpeed;
                 active = true;
-            } else {
-                g_BoostVec[1] = 0.0f;
             }
 
             if (GetAsyncKeyState(g_ForwardKey) & 0x8000) {
                 if (g_PlayerContext && !IsBadReadPtr((void*)g_PlayerContext, 0x100)) {
-                    // НАСТОЯЩИЙ FORWARD VECTOR: X на +0x80, Z на +0x88
-                    float fwdX = *(float*)(g_PlayerContext + 0x80);
-                    float fwdZ = *(float*)(g_PlayerContext + 0x88);
+                    float fwdX = *(float*)(g_PlayerContext + 0x7C);
+                    float fwdZ = *(float*)(g_PlayerContext + 0x80);
                     
-                    g_BoostVec[0] = fwdX * g_ForwardSpeed;
-                    g_BoostVec[2] = fwdZ * g_ForwardSpeed;
+                    // Инвертируем вектор (-fwdX), чтобы лететь вперед, а не назад
+                    boostX = -fwdX * g_ForwardSpeed;
+                    boostZ = -fwdZ * g_ForwardSpeed;
                     active = true;
                 }
-            } else {
-                g_BoostVec[0] = 0.0f;
-                g_BoostVec[2] = 0.0f;
             }
 
-            g_BoostActive = active ? 1 : 0;
+            if (active) {
+                g_BoostVec[0] = boostX;
+                g_BoostVec[1] = boostY;
+                g_BoostVec[2] = boostZ;
+                g_BoostActive = 1;
+
+                // --- АНТИ-СМЕРТЬ (Сброс инерции) ---
+                if (g_PlayerContext && !IsBadReadPtr((void*)g_PlayerContext, 0x200)) {
+                    // Синхронизируем дублирующуюся позицию на +0x1A0 с +0x90
+                    // Это обманывает расчет скорости в движке: Velocity = (Pos - PrevPos) = 0
+                    float* posCurrent = (float*)(g_PlayerContext + 0x90);
+                    float* posPrev = (float*)(g_PlayerContext + 0x1A0);
+                    posPrev[0] = posCurrent[0];
+                    posPrev[1] = posCurrent[1];
+                    posPrev[2] = posCurrent[2];
+
+                    // Обнуляем вектор на +0xA0 (предположительно вектор скорости/импульса)
+                    float* velA = (float*)(g_PlayerContext + 0xA0);
+                    velA[0] = 0.0f; velA[1] = 0.0f; velA[2] = 0.0f;
+                }
+            } else {
+                g_BoostActive = 0;
+            }
         } else {
-            g_BoostVec[0] = 0.0f;
-            g_BoostVec[1] = 0.0f;
-            g_BoostVec[2] = 0.0f;
             g_BoostActive = 0;
         }
         Sleep(10);
@@ -220,7 +237,7 @@ static bool InstallPatch() {
     *p++ = 0x83; *p++ = 0x38; *p++ = 0x00; // cmp dword ptr [rax], 0
     *p++ = 0x74; *p++ = 0x0D; // je skip
 
-    // Add boost to xmm0
+    // Add boost to xmm0 (safe addition)
     *p++ = 0x48; *p++ = 0xB8; // mov rax, &g_BoostVec
     *reinterpret_cast<uint64_t*>(p) = reinterpret_cast<uint64_t>(&g_BoostVec[0]); p += 8;
     
