@@ -12,6 +12,7 @@ static uint8_t* g_trampoline = nullptr;
 static uint8_t* g_patchAddr  = nullptr;
 
 alignas(16) static float g_BoostVec[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+alignas(16) static float g_TempVector[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
 static volatile int32_t g_BoostActive = 0;
 
 static uintptr_t g_rbxBuffer[1024];
@@ -24,16 +25,6 @@ static int g_ForwardKey = VK_LSHIFT;
 static float g_AscendSpeed = 4.0f;
 static float g_DescendSpeed = -4.0f;
 static float g_ForwardSpeed = 10.0f; 
-
-static void WriteLog(const char* msg) {
-    HANDLE h = CreateFileA("CDFlight_Context.log", FILE_APPEND_DATA, FILE_SHARE_READ,
-        nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
-    if (h == INVALID_HANDLE_VALUE) return;
-    DWORD wrote = 0;
-    WriteFile(h, msg, (DWORD)strlen(msg), &wrote, nullptr);
-    WriteFile(h, "\r\n", 2, &wrote, nullptr);
-    CloseHandle(h);
-}
 
 static bool IsGameForeground() {
     HWND hwnd = GetForegroundWindow();
@@ -220,12 +211,10 @@ static bool InstallPatch() {
     *p++ = 0x9D; // popfq
     // --- END RING BUFFER ---
 
-    // Original instruction FIRST: movups [r13], xmm0
-    // This allows the engine to write the delta position naturally!
-    *p++ = 0x41; *p++ = 0x0F; *p++ = 0x11; *p++ = 0x45; *p++ = 0x00;
+    // 1. Execute Original Instruction FIRST
+    *p++ = 0x41; *p++ = 0x0F; *p++ = 0x11; *p++ = 0x45; *p++ = 0x00; // movups [r13], xmm0
 
-    // NOW WE CHECK IF WE NEED TO OVERRIDE THE NEWLY WRITTEN POSITION!
-    // This completely bypasses modifying xmm0 and destroying flags or other math.
+    // 2. Check if boost is active
     *p++ = 0x9C; // pushfq
     *p++ = 0x50; // push rax
 
@@ -233,20 +222,30 @@ static bool InstallPatch() {
     *reinterpret_cast<uint64_t*>(p) = reinterpret_cast<uint64_t>(&g_BoostActive); p += 8;
     
     *p++ = 0x83; *p++ = 0x38; *p++ = 0x00; // cmp dword ptr [rax], 0
-    *p++ = 0x74; *p++ = 0x16; // je skip (22 bytes forward)
+    *p++ = 0x74; *p++ = 0x2A; // je skip (42 bytes forward)
 
-    // Load original newly written XYZW from [r13] to xmm0
+    // 3. We are boosting! We must modify [r13], BUT we CANNOT clobber xmm0!
+    // We will save xmm0 to g_TempVector, use xmm0 to do math, write to [r13], then RESTORE xmm0!
+    
+    *p++ = 0x48; *p++ = 0xB8; // mov rax, &g_TempVector
+    *reinterpret_cast<uint64_t*>(p) = reinterpret_cast<uint64_t>(&g_TempVector[0]); p += 8;
+    *p++ = 0x0F; *p++ = 0x11; *p++ = 0x00; // movups [rax], xmm0 (Save original xmm0)
+
+    // Load newly written pos from [r13] to xmm0
     *p++ = 0x41; *p++ = 0x0F; *p++ = 0x10; *p++ = 0x45; *p++ = 0x00; // movups xmm0, [r13]
 
-    // Load boost vector
+    // Add boost vector
     *p++ = 0x48; *p++ = 0xB8; // mov rax, &g_BoostVec
     *reinterpret_cast<uint64_t*>(p) = reinterpret_cast<uint64_t>(&g_BoostVec[0]); p += 8;
-
-    // ADD the boost directly to the position delta! (Safe addps, W is 0.0 so W remains unchanged)
     *p++ = 0x0F; *p++ = 0x58; *p++ = 0x00; // addps xmm0, [rax]
 
-    // Write the boosted position back to [r13]
+    // Write boosted pos back to [r13]
     *p++ = 0x41; *p++ = 0x0F; *p++ = 0x11; *p++ = 0x45; *p++ = 0x00; // movups [r13], xmm0
+
+    // Restore original xmm0 from g_TempVector!
+    *p++ = 0x48; *p++ = 0xB8; // mov rax, &g_TempVector
+    *reinterpret_cast<uint64_t*>(p) = reinterpret_cast<uint64_t>(&g_TempVector[0]); p += 8;
+    *p++ = 0x0F; *p++ = 0x10; *p++ = 0x00; // movups xmm0, [rax]
 
     // skip:
     *p++ = 0x58; // pop rax
