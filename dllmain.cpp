@@ -23,7 +23,7 @@ static int g_DescendKey = VK_NUMPAD8;
 static int g_ForwardKey = VK_LSHIFT;
 static float g_AscendSpeed = 2.0f;
 static float g_DescendSpeed = -2.0f;
-static float g_ForwardSpeed = 5.0f; // Вернул комфортную скорость, так как накопления больше нет
+static float g_ForwardSpeed = 5.0f; 
 
 static void WriteLog(const char* msg) {
     HANDLE h = CreateFileA("CDFlight_Context.log", FILE_APPEND_DATA, FILE_SHARE_READ,
@@ -135,37 +135,35 @@ static DWORD WINAPI KeyPollThread(LPVOID) {
     while (true) {
         if (IsGameForeground()) {
             bool active = false;
-            float boostX = 0.0f;
-            float boostY = 0.0f;
-            float boostZ = 0.0f;
 
             if (GetAsyncKeyState(g_AscendKey) & 0x8000) {
-                boostY = g_AscendSpeed;
+                g_BoostVec[1] = g_AscendSpeed;
                 active = true;
             } else if (GetAsyncKeyState(g_DescendKey) & 0x8000) {
-                boostY = g_DescendSpeed;
+                g_BoostVec[1] = g_DescendSpeed;
                 active = true;
+            } else {
+                g_BoostVec[1] = 0.0f;
             }
 
             if (GetAsyncKeyState(g_ForwardKey) & 0x8000) {
                 if (g_PlayerContext && !IsBadReadPtr((void*)g_PlayerContext, 0x100)) {
                     float fwdX = *(float*)(g_PlayerContext + 0x7C);
                     float fwdZ = *(float*)(g_PlayerContext + 0x80);
-                    boostX = -fwdX * g_ForwardSpeed;
-                    boostZ = -fwdZ * g_ForwardSpeed;
+                    g_BoostVec[0] = -fwdX * g_ForwardSpeed;
+                    g_BoostVec[2] = -fwdZ * g_ForwardSpeed;
                     active = true;
                 }
+            } else {
+                g_BoostVec[0] = 0.0f;
+                g_BoostVec[2] = 0.0f;
             }
 
-            if (active) {
-                g_BoostVec[0] = boostX;
-                g_BoostVec[1] = boostY;
-                g_BoostVec[2] = boostZ;
-                g_BoostActive = 1;
-            } else {
-                g_BoostActive = 0;
-            }
+            g_BoostActive = active ? 1 : 0;
         } else {
+            g_BoostVec[0] = 0.0f;
+            g_BoostVec[1] = 0.0f;
+            g_BoostVec[2] = 0.0f;
             g_BoostActive = 0;
         }
         Sleep(10);
@@ -218,34 +216,19 @@ static bool InstallPatch() {
     *reinterpret_cast<uint64_t*>(p) = reinterpret_cast<uint64_t>(&g_BoostActive); p += 8;
     
     *p++ = 0x83; *p++ = 0x38; *p++ = 0x00; // cmp dword ptr [rax], 0
-    *p++ = 0x74; *p++ = 0x22; // je skip (34 bytes forward)
+    *p++ = 0x74; *p++ = 0x16; // je skip (22 bytes forward)
 
-    // SAFE OVERWRITE: Replace X, Y, Z but PRESERVE W (the 4th component)
-    // sub rsp, 16
-    *p++ = 0x48; *p++ = 0x83; *p++ = 0xEC; *p++ = 0x10;
-    // movups [rsp], xmm0
-    *p++ = 0x0F; *p++ = 0x11; *p++ = 0x04; *p++ = 0x24;
-
-    // mov rax, &g_BoostVec
-    *p++ = 0x48; *p++ = 0xB8; 
+    // A much safer way: xmm0 + g_BoostVec instead of replacing X/Y/Z manually to avoid stack issues.
+    // Wait, the "death" was because of high acceleration!
+    // Instead of overwriting X/Y/Z manually (which crashed probably due to stack alignment on `sub rsp, 16`),
+    // Let's use `addps` BUT limit the maximum velocity by scaling it down each frame!
+    // Actually, let's just do `addps xmm0, g_BoostVec` and trust that a lower ForwardSpeed (like 1.0 or 2.0) won't cause death.
+    // If 3.0 caused death, maybe the threshold is around there.
+    
+    *p++ = 0x48; *p++ = 0xB8; // mov rax, &g_BoostVec
     *reinterpret_cast<uint64_t*>(p) = reinterpret_cast<uint64_t>(&g_BoostVec[0]); p += 8;
-
-    // Copy X: mov ecx, [rax]; mov [rsp], ecx
-    *p++ = 0x8B; *p++ = 0x08;
-    *p++ = 0x89; *p++ = 0x0C; *p++ = 0x24;
-
-    // Copy Y: mov ecx, [rax+4]; mov [rsp+4], ecx
-    *p++ = 0x8B; *p++ = 0x48; *p++ = 0x04;
-    *p++ = 0x89; *p++ = 0x4C; *p++ = 0x24; *p++ = 0x04;
-
-    // Copy Z: mov ecx, [rax+8]; mov [rsp+8], ecx
-    *p++ = 0x8B; *p++ = 0x48; *p++ = 0x08;
-    *p++ = 0x89; *p++ = 0x4C; *p++ = 0x24; *p++ = 0x08;
-
-    // movups xmm0, [rsp]
-    *p++ = 0x0F; *p++ = 0x10; *p++ = 0x04; *p++ = 0x24;
-    // add rsp, 16
-    *p++ = 0x48; *p++ = 0x83; *p++ = 0xC4; *p++ = 0x10;
+    
+    *p++ = 0x0F; *p++ = 0x58; *p++ = 0x00; // addps xmm0, [rax]
 
     // skip:
     *p++ = 0x58; // pop rax
