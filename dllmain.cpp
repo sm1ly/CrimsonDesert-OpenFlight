@@ -12,6 +12,7 @@ static uint8_t* g_trampoline = nullptr;
 static uint8_t* g_patchAddr  = nullptr;
 
 alignas(16) static float g_BoostVec[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+alignas(16) static float g_TempXMM1[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
 static volatile int32_t g_BoostActive = 0;
 
 static uintptr_t g_rbxBuffer[1024];
@@ -23,7 +24,7 @@ static int g_DescendKey = VK_NUMPAD8;
 static int g_ForwardKey = VK_LSHIFT;
 static float g_AscendSpeed = 4.0f;
 static float g_DescendSpeed = -4.0f;
-static float g_ForwardSpeed = 8.0f; // Возвращаем нормальную скорость полета
+static float g_ForwardSpeed = 8.0f; 
 
 static void WriteLog(const char* msg) {
     HANDLE h = CreateFileA("CDFlight_Context.log", FILE_APPEND_DATA, FILE_SHARE_READ,
@@ -218,19 +219,26 @@ static bool InstallPatch() {
     *reinterpret_cast<uint64_t*>(p) = reinterpret_cast<uint64_t>(&g_BoostActive); p += 8;
     
     *p++ = 0x83; *p++ = 0x38; *p++ = 0x00; // cmp dword ptr [rax], 0
-    *p++ = 0x74; *p++ = 0x17; // je skip (23 bytes forward)
+    *p++ = 0x74; *p++ = 0x2D; // je skip (45 bytes forward)
 
-    // --- MAGIC BLENDPS OVERWRITE ---
-    // This solves EVERYTHING: No stack crash, no W-component floor fall, no velocity buildup!
-    // mov rax, &g_BoostVec
-    *p++ = 0x48; *p++ = 0xB8;
+    // --- SAFE BLENDPS OVERWRITE ---
+    // Save xmm1 to g_TempXMM1
+    *p++ = 0x48; *p++ = 0xB8; // mov rax, &g_TempXMM1
+    *reinterpret_cast<uint64_t*>(p) = reinterpret_cast<uint64_t>(&g_TempXMM1[0]); p += 8;
+    *p++ = 0x0F; *p++ = 0x11; *p++ = 0x08; // movups [rax], xmm1
+
+    // Load g_BoostVec into xmm1
+    *p++ = 0x48; *p++ = 0xB8; // mov rax, &g_BoostVec
     *reinterpret_cast<uint64_t*>(p) = reinterpret_cast<uint64_t>(&g_BoostVec[0]); p += 8;
-    
-    // movups xmm1, [rax]
-    *p++ = 0x0F; *p++ = 0x10; *p++ = 0x08;
+    *p++ = 0x0F; *p++ = 0x10; *p++ = 0x08; // movups xmm1, [rax]
 
     // blendps xmm0, xmm1, 7 (0111b = overwrite X, Y, Z, keep W)
     *p++ = 0x66; *p++ = 0x0F; *p++ = 0x3A; *p++ = 0x04; *p++ = 0xC1; *p++ = 0x07;
+
+    // Restore xmm1
+    *p++ = 0x48; *p++ = 0xB8; // mov rax, &g_TempXMM1
+    *reinterpret_cast<uint64_t*>(p) = reinterpret_cast<uint64_t>(&g_TempXMM1[0]); p += 8;
+    *p++ = 0x0F; *p++ = 0x10; *p++ = 0x08; // movups xmm1, [rax]
 
     // skip:
     *p++ = 0x58; // pop rax
