@@ -11,11 +11,9 @@ static const uint8_t  kExpected[5] = { 0x41, 0x0F, 0x11, 0x45, 0x00 };
 static uint8_t* g_trampoline = nullptr;
 static uint8_t* g_patchAddr  = nullptr;
 
-alignas(16) static float g_BoostXZ[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
-static float g_BoostY = 0.0f;
-
-static volatile int32_t g_ModifyY = 0;
-static volatile int32_t g_ModifyXZ = 0;
+alignas(16) static float g_BoostVec[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+alignas(16) static float g_TempVector[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+static volatile int32_t g_BoostActive = 0;
 
 static uintptr_t g_rbxBuffer[1024];
 static volatile int32_t g_rbxIndex = 0;
@@ -24,19 +22,9 @@ static uintptr_t g_PlayerContext = 0;
 static int g_AscendKey = VK_NUMPAD9;
 static int g_DescendKey = VK_NUMPAD8;
 static int g_ForwardKey = VK_LSHIFT;
-static float g_AscendSpeed = 6.0f; // Увеличил для лучшего контроля по Y
-static float g_DescendSpeed = -6.0f;
-static float g_ForwardSpeed = 12.0f; 
-
-static void WriteLog(const char* msg) {
-    HANDLE h = CreateFileA("CDFlight_Context.log", FILE_APPEND_DATA, FILE_SHARE_READ,
-        nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
-    if (h == INVALID_HANDLE_VALUE) return;
-    DWORD wrote = 0;
-    WriteFile(h, msg, (DWORD)strlen(msg), &wrote, nullptr);
-    WriteFile(h, "\r\n", 2, &wrote, nullptr);
-    CloseHandle(h);
-}
+static float g_AscendSpeed = 4.0f;
+static float g_DescendSpeed = -4.0f;
+static float g_ForwardSpeed = 10.0f; 
 
 static bool IsGameForeground() {
     HWND hwnd = GetForegroundWindow();
@@ -72,11 +60,11 @@ static uintptr_t FindUserActorPtr() {
 static uintptr_t GetKliff() {
     static uintptr_t userActorPtr = 0;
     if (!userActorPtr) userActorPtr = FindUserActorPtr();
-    if (!userActorPtr) return 0;
+    if (!userActorPtr || IsBadReadPtr((void*)userActorPtr, 8)) return 0;
     
     __try {
         uintptr_t userActor = *reinterpret_cast<uintptr_t*>(userActorPtr);
-        if (!userActor) return 0;
+        if (!userActor || IsBadReadPtr((void*)userActor, 0xE0)) return 0;
         
         uintptr_t kliff = *reinterpret_cast<uintptr_t*>(userActor + 0xD0);
         if (kliff == 0xFFFFFFFFFFFFFFFFull || kliff == 0) {
@@ -103,28 +91,30 @@ static void LoadConfig() {
     g_ForwardKey = GetPrivateProfileIntA("Settings", "ForwardKey", VK_LSHIFT, iniPath.c_str());
     
     char buf[32];
-    GetPrivateProfileStringA("Settings", "AscendSpeed", "6.0", buf, sizeof(buf), iniPath.c_str());
+    GetPrivateProfileStringA("Settings", "AscendSpeed", "4.0", buf, sizeof(buf), iniPath.c_str());
     g_AscendSpeed = std::stof(buf);
     
-    GetPrivateProfileStringA("Settings", "DescendSpeed", "-6.0", buf, sizeof(buf), iniPath.c_str());
+    GetPrivateProfileStringA("Settings", "DescendSpeed", "-4.0", buf, sizeof(buf), iniPath.c_str());
     g_DescendSpeed = std::stof(buf);
 
-    GetPrivateProfileStringA("Settings", "ForwardSpeed", "12.0", buf, sizeof(buf), iniPath.c_str());
+    GetPrivateProfileStringA("Settings", "ForwardSpeed", "10.0", buf, sizeof(buf), iniPath.c_str());
     g_ForwardSpeed = std::stof(buf);
 }
 
 static DWORD WINAPI KeyPollThread(LPVOID) {
     while (true) {
         if (IsGameForeground()) {
-            bool modY = false;
-            bool modXZ = false;
+            bool active = false;
+            float targetX = 0.0f;
+            float targetY = 0.0f;
+            float targetZ = 0.0f;
 
             if (GetAsyncKeyState(g_AscendKey) & 0x8000) {
-                g_BoostY = g_AscendSpeed;
-                modY = true;
+                targetY = g_AscendSpeed;
+                active = true;
             } else if (GetAsyncKeyState(g_DescendKey) & 0x8000) {
-                g_BoostY = g_DescendSpeed;
-                modY = true;
+                targetY = g_DescendSpeed;
+                active = true;
             }
 
             if (GetAsyncKeyState(g_ForwardKey) & 0x8000) {
@@ -133,7 +123,6 @@ static DWORD WINAPI KeyPollThread(LPVOID) {
                     for (int i = 0; i < 1024; i++) {
                         uintptr_t ctx = g_rbxBuffer[i];
                         if (!ctx) continue;
-                        
                         __try {
                             bool found = false;
                             for (int j = 0; j < 0x300; j += 8) {
@@ -146,9 +135,7 @@ static DWORD WINAPI KeyPollThread(LPVOID) {
                                 g_PlayerContext = ctx;
                                 break;
                             }
-                        } __except(EXCEPTION_EXECUTE_HANDLER) {
-                            continue;
-                        }
+                        } __except(EXCEPTION_EXECUTE_HANDLER) { continue; }
                     }
                 }
 
@@ -156,20 +143,25 @@ static DWORD WINAPI KeyPollThread(LPVOID) {
                     __try {
                         float fwdX = *(float*)(g_PlayerContext + 0x7C);
                         float fwdZ = *(float*)(g_PlayerContext + 0x80);
-                        g_BoostXZ[0] = -fwdX * g_ForwardSpeed;
-                        g_BoostXZ[2] = -fwdZ * g_ForwardSpeed;
-                        modXZ = true;
+                        targetX = -fwdX * g_ForwardSpeed;
+                        targetZ = -fwdZ * g_ForwardSpeed;
+                        active = true;
                     } __except(EXCEPTION_EXECUTE_HANDLER) {
                         g_PlayerContext = 0; 
                     }
                 }
             }
 
-            g_ModifyY = modY ? 1 : 0;
-            g_ModifyXZ = modXZ ? 1 : 0;
+            if (active) {
+                g_BoostVec[0] = targetX;
+                g_BoostVec[1] = targetY;
+                g_BoostVec[2] = targetZ;
+                g_BoostActive = 1;
+            } else {
+                g_BoostActive = 0;
+            }
         } else {
-            g_ModifyY = 0;
-            g_ModifyXZ = 0;
+            g_BoostActive = 0;
         }
         Sleep(10);
     }
@@ -196,6 +188,7 @@ static bool InstallPatch() {
     uint8_t* p = g_trampoline;
 
     // --- RING BUFFER CAPTURE ---
+    *p++ = 0x9C; // pushfq (ОЧЕНЬ ВАЖНО: сохраняем флаги процессора!)
     *p++ = 0x50; // push rax
     *p++ = 0x51; // push rcx
     *p++ = 0x52; // push rdx
@@ -212,40 +205,39 @@ static bool InstallPatch() {
     *reinterpret_cast<uint64_t*>(p) = reinterpret_cast<uint64_t>(&g_rbxBuffer[0]); p += 8;
     *p++ = 0x48; *p++ = 0x89; *p++ = 0x1C; *p++ = 0xD0; // mov [rax + rdx*8], rbx
 
+    // --- XMM0 SAFE OVERWRITE ---
+    // Check if boost is active
+    *p++ = 0x48; *p++ = 0xB8; // mov rax, &g_BoostActive
+    *reinterpret_cast<uint64_t*>(p) = reinterpret_cast<uint64_t>(&g_BoostActive); p += 8;
+    
+    *p++ = 0x83; *p++ = 0x38; *p++ = 0x00; // cmp dword ptr [rax], 0
+    *p++ = 0x74; *p++ = 0x22; // je skip (34 bytes forward)
+
+    // Save xmm0 to g_TempVector
+    *p++ = 0x48; *p++ = 0xB8; // mov rax, &g_TempVector
+    *reinterpret_cast<uint64_t*>(p) = reinterpret_cast<uint64_t>(&g_TempVector[0]); p += 8;
+    *p++ = 0x0F; *p++ = 0x11; *p++ = 0x00; // movups [rax], xmm0
+
+    // Load g_BoostVec
+    *p++ = 0x48; *p++ = 0xB9; // mov rcx, &g_BoostVec
+    *reinterpret_cast<uint64_t*>(p) = reinterpret_cast<uint64_t>(&g_BoostVec[0]); p += 8;
+
+    // Copy X, Y (8 bytes)
+    *p++ = 0x48; *p++ = 0x8B; *p++ = 0x11; // mov rdx, [rcx]
+    *p++ = 0x48; *p++ = 0x89; *p++ = 0x10; // mov [rax], rdx
+
+    // Copy Z (4 bytes)
+    *p++ = 0x8B; *p++ = 0x51; *p++ = 0x08; // mov edx, [rcx + 8]
+    *p++ = 0x89; *p++ = 0x50; *p++ = 0x08; // mov [rax + 8], edx
+
+    // Restore xmm0 from g_TempVector
+    *p++ = 0x0F; *p++ = 0x10; *p++ = 0x00; // movups xmm0, [rax]
+
+    // skip:
     *p++ = 0x5A; // pop rdx
     *p++ = 0x59; // pop rcx
-    // --- END RING BUFFER ---
-
-    *p++ = 0x50; // push rax
-    *p++ = 0x51; // push rcx
-    
-    // --- SURGICAL Y OVERWRITE (NUM 9 / NUM 8) ---
-    *p++ = 0x48; *p++ = 0xB8; // mov rax, &g_ModifyY
-    *reinterpret_cast<uint64_t*>(p) = reinterpret_cast<uint64_t>(&g_ModifyY); p += 8;
-    *p++ = 0x83; *p++ = 0x38; *p++ = 0x00; // cmp dword ptr [rax], 0
-    *p++ = 0x74; *p++ = 0x0E; // je skip_y (14 bytes)
-
-    *p++ = 0x48; *p++ = 0xB8; // mov rax, &g_BoostY
-    *reinterpret_cast<uint64_t*>(p) = reinterpret_cast<uint64_t>(&g_BoostY); p += 8;
-    *p++ = 0xF3; *p++ = 0x0F; *p++ = 0x10; *p++ = 0x08; // movss xmm1, [rax]
-    *p++ = 0x66; *p++ = 0x0F; *p++ = 0x3A; *p++ = 0x21; *p++ = 0xC1; *p++ = 0x10; // insertps xmm0, xmm1, 0x10
-
-    // skip_y:
-
-    // --- SURGICAL X/Z OVERWRITE (SHIFT) ---
-    *p++ = 0x48; *p++ = 0xB8; // mov rax, &g_ModifyXZ
-    *reinterpret_cast<uint64_t*>(p) = reinterpret_cast<uint64_t>(&g_ModifyXZ); p += 8;
-    *p++ = 0x83; *p++ = 0x38; *p++ = 0x00; // cmp dword ptr [rax], 0
-    *p++ = 0x74; *p++ = 0x0E; // je skip_xz (14 bytes)
-
-    *p++ = 0x48; *p++ = 0xB8; // mov rax, &g_BoostXZ
-    *reinterpret_cast<uint64_t*>(p) = reinterpret_cast<uint64_t>(&g_BoostXZ[0]); p += 8;
-    *p++ = 0x0F; *p++ = 0x10; *p++ = 0x08; // movups xmm1, [rax]
-    *p++ = 0x66; *p++ = 0x0F; *p++ = 0x3A; *p++ = 0x04; *p++ = 0xC1; *p++ = 0x05; // blendps xmm0, xmm1, 5 (Overwrite X, Z)
-
-    // skip_xz:
-    *p++ = 0x59; // pop rcx
     *p++ = 0x58; // pop rax
+    *p++ = 0x9D; // popfq (ОЧЕНЬ ВАЖНО: восстанавливаем флаги!)
 
     // Original instruction: movups [r13], xmm0
     *p++ = 0x41; *p++ = 0x0F; *p++ = 0x11; *p++ = 0x45; *p++ = 0x00;
@@ -268,7 +260,6 @@ static bool InstallPatch() {
 BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID reserved) {
     if (reason == DLL_PROCESS_ATTACH) {
         DisableThreadLibraryCalls(hModule);
-        DeleteFileA("CDFlight_Context.log");
         LoadConfig();
         CreateThread(nullptr, 0, KeyPollThread, nullptr, 0, nullptr);
         InstallPatch();
