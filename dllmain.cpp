@@ -23,7 +23,7 @@ static int g_DescendKey = VK_NUMPAD8;
 static int g_ForwardKey = VK_LSHIFT;
 static float g_AscendSpeed = 2.0f;
 static float g_DescendSpeed = -2.0f;
-static float g_ForwardSpeed = 3.0f;
+static float g_ForwardSpeed = 5.0f; // Вернул комфортную скорость, так как накопления больше нет
 
 static void WriteLog(const char* msg) {
     HANDLE h = CreateFileA("CDFlight_Context.log", FILE_APPEND_DATA, FILE_SHARE_READ,
@@ -102,7 +102,7 @@ static void LoadConfig() {
     GetPrivateProfileStringA("Settings", "DescendSpeed", "-2.0", buf, sizeof(buf), iniPath.c_str());
     g_DescendSpeed = std::stof(buf);
 
-    GetPrivateProfileStringA("Settings", "ForwardSpeed", "3.0", buf, sizeof(buf), iniPath.c_str());
+    GetPrivateProfileStringA("Settings", "ForwardSpeed", "5.0", buf, sizeof(buf), iniPath.c_str());
     g_ForwardSpeed = std::stof(buf);
 }
 
@@ -151,8 +151,6 @@ static DWORD WINAPI KeyPollThread(LPVOID) {
                 if (g_PlayerContext && !IsBadReadPtr((void*)g_PlayerContext, 0x100)) {
                     float fwdX = *(float*)(g_PlayerContext + 0x7C);
                     float fwdZ = *(float*)(g_PlayerContext + 0x80);
-                    
-                    // Инвертируем вектор (-fwdX), чтобы лететь вперед, а не назад
                     boostX = -fwdX * g_ForwardSpeed;
                     boostZ = -fwdZ * g_ForwardSpeed;
                     active = true;
@@ -164,21 +162,6 @@ static DWORD WINAPI KeyPollThread(LPVOID) {
                 g_BoostVec[1] = boostY;
                 g_BoostVec[2] = boostZ;
                 g_BoostActive = 1;
-
-                // --- АНТИ-СМЕРТЬ (Сброс инерции) ---
-                if (g_PlayerContext && !IsBadReadPtr((void*)g_PlayerContext, 0x200)) {
-                    // Синхронизируем дублирующуюся позицию на +0x1A0 с +0x90
-                    // Это обманывает расчет скорости в движке: Velocity = (Pos - PrevPos) = 0
-                    float* posCurrent = (float*)(g_PlayerContext + 0x90);
-                    float* posPrev = (float*)(g_PlayerContext + 0x1A0);
-                    posPrev[0] = posCurrent[0];
-                    posPrev[1] = posCurrent[1];
-                    posPrev[2] = posCurrent[2];
-
-                    // Обнуляем вектор на +0xA0 (предположительно вектор скорости/импульса)
-                    float* velA = (float*)(g_PlayerContext + 0xA0);
-                    velA[0] = 0.0f; velA[1] = 0.0f; velA[2] = 0.0f;
-                }
             } else {
                 g_BoostActive = 0;
             }
@@ -235,13 +218,34 @@ static bool InstallPatch() {
     *reinterpret_cast<uint64_t*>(p) = reinterpret_cast<uint64_t>(&g_BoostActive); p += 8;
     
     *p++ = 0x83; *p++ = 0x38; *p++ = 0x00; // cmp dword ptr [rax], 0
-    *p++ = 0x74; *p++ = 0x0D; // je skip
+    *p++ = 0x74; *p++ = 0x22; // je skip (34 bytes forward)
 
-    // Add boost to xmm0 (safe addition)
-    *p++ = 0x48; *p++ = 0xB8; // mov rax, &g_BoostVec
+    // SAFE OVERWRITE: Replace X, Y, Z but PRESERVE W (the 4th component)
+    // sub rsp, 16
+    *p++ = 0x48; *p++ = 0x83; *p++ = 0xEC; *p++ = 0x10;
+    // movups [rsp], xmm0
+    *p++ = 0x0F; *p++ = 0x11; *p++ = 0x04; *p++ = 0x24;
+
+    // mov rax, &g_BoostVec
+    *p++ = 0x48; *p++ = 0xB8; 
     *reinterpret_cast<uint64_t*>(p) = reinterpret_cast<uint64_t>(&g_BoostVec[0]); p += 8;
-    
-    *p++ = 0x0F; *p++ = 0x58; *p++ = 0x00; // addps xmm0, [rax]
+
+    // Copy X: mov ecx, [rax]; mov [rsp], ecx
+    *p++ = 0x8B; *p++ = 0x08;
+    *p++ = 0x89; *p++ = 0x0C; *p++ = 0x24;
+
+    // Copy Y: mov ecx, [rax+4]; mov [rsp+4], ecx
+    *p++ = 0x8B; *p++ = 0x48; *p++ = 0x04;
+    *p++ = 0x89; *p++ = 0x4C; *p++ = 0x24; *p++ = 0x04;
+
+    // Copy Z: mov ecx, [rax+8]; mov [rsp+8], ecx
+    *p++ = 0x8B; *p++ = 0x48; *p++ = 0x08;
+    *p++ = 0x89; *p++ = 0x4C; *p++ = 0x24; *p++ = 0x08;
+
+    // movups xmm0, [rsp]
+    *p++ = 0x0F; *p++ = 0x10; *p++ = 0x04; *p++ = 0x24;
+    // add rsp, 16
+    *p++ = 0x48; *p++ = 0x83; *p++ = 0xC4; *p++ = 0x10;
 
     // skip:
     *p++ = 0x58; // pop rax
