@@ -23,7 +23,7 @@ static int g_DescendKey = VK_NUMPAD8;
 static int g_ForwardKey = VK_LSHIFT;
 static float g_AscendSpeed = 2.0f;
 static float g_DescendSpeed = -2.0f;
-static float g_ForwardSpeed = 5.0f; 
+static float g_ForwardSpeed = 3.0f;
 
 static void WriteLog(const char* msg) {
     HANDLE h = CreateFileA("CDFlight_Context.log", FILE_APPEND_DATA, FILE_SHARE_READ,
@@ -102,7 +102,7 @@ static void LoadConfig() {
     GetPrivateProfileStringA("Settings", "DescendSpeed", "-2.0", buf, sizeof(buf), iniPath.c_str());
     g_DescendSpeed = std::stof(buf);
 
-    GetPrivateProfileStringA("Settings", "ForwardSpeed", "5.0", buf, sizeof(buf), iniPath.c_str());
+    GetPrivateProfileStringA("Settings", "ForwardSpeed", "3.0", buf, sizeof(buf), iniPath.c_str());
     g_ForwardSpeed = std::stof(buf);
 }
 
@@ -132,39 +132,59 @@ static DWORD WINAPI ScannerThread(LPVOID) {
 }
 
 static DWORD WINAPI KeyPollThread(LPVOID) {
+    float targetX = 0.0f;
+    float targetY = 0.0f;
+    float targetZ = 0.0f;
+    
+    // Smooth damping multiplier (0.0 to 1.0)
+    // 0.1 means it loses 10% of the difference per 10ms tick.
+    const float damping = 0.05f; 
+
     while (true) {
         if (IsGameForeground()) {
             bool active = false;
+            targetX = 0.0f;
+            targetY = 0.0f;
+            targetZ = 0.0f;
 
             if (GetAsyncKeyState(g_AscendKey) & 0x8000) {
-                g_BoostVec[1] = g_AscendSpeed;
+                targetY = g_AscendSpeed;
                 active = true;
             } else if (GetAsyncKeyState(g_DescendKey) & 0x8000) {
-                g_BoostVec[1] = g_DescendSpeed;
+                targetY = g_DescendSpeed;
                 active = true;
-            } else {
-                g_BoostVec[1] = 0.0f;
             }
 
             if (GetAsyncKeyState(g_ForwardKey) & 0x8000) {
                 if (g_PlayerContext && !IsBadReadPtr((void*)g_PlayerContext, 0x100)) {
                     float fwdX = *(float*)(g_PlayerContext + 0x7C);
                     float fwdZ = *(float*)(g_PlayerContext + 0x80);
-                    g_BoostVec[0] = -fwdX * g_ForwardSpeed;
-                    g_BoostVec[2] = -fwdZ * g_ForwardSpeed;
+                    targetX = -fwdX * g_ForwardSpeed;
+                    targetZ = -fwdZ * g_ForwardSpeed;
                     active = true;
                 }
-            } else {
-                g_BoostVec[0] = 0.0f;
-                g_BoostVec[2] = 0.0f;
             }
 
-            g_BoostActive = active ? 1 : 0;
+            // --- INERTIA DAMPING ---
+            // Move g_BoostVec smoothly towards the target vectors
+            g_BoostVec[0] += (targetX - g_BoostVec[0]) * damping;
+            g_BoostVec[1] += (targetY - g_BoostVec[1]) * damping;
+            g_BoostVec[2] += (targetZ - g_BoostVec[2]) * damping;
+
+            // Keep it active as long as we are still gliding to a halt
+            if (active || abs(g_BoostVec[0]) > 0.05f || abs(g_BoostVec[1]) > 0.05f || abs(g_BoostVec[2]) > 0.05f) {
+                g_BoostActive = 1;
+            } else {
+                g_BoostActive = 0;
+                g_BoostVec[0] = 0.0f;
+                g_BoostVec[1] = 0.0f;
+                g_BoostVec[2] = 0.0f;
+            }
         } else {
+            g_BoostActive = 0;
             g_BoostVec[0] = 0.0f;
             g_BoostVec[1] = 0.0f;
             g_BoostVec[2] = 0.0f;
-            g_BoostActive = 0;
         }
         Sleep(10);
     }
@@ -216,15 +236,9 @@ static bool InstallPatch() {
     *reinterpret_cast<uint64_t*>(p) = reinterpret_cast<uint64_t>(&g_BoostActive); p += 8;
     
     *p++ = 0x83; *p++ = 0x38; *p++ = 0x00; // cmp dword ptr [rax], 0
-    *p++ = 0x74; *p++ = 0x16; // je skip (22 bytes forward)
+    *p++ = 0x74; *p++ = 0x0D; // je skip
 
-    // A much safer way: xmm0 + g_BoostVec instead of replacing X/Y/Z manually to avoid stack issues.
-    // Wait, the "death" was because of high acceleration!
-    // Instead of overwriting X/Y/Z manually (which crashed probably due to stack alignment on `sub rsp, 16`),
-    // Let's use `addps` BUT limit the maximum velocity by scaling it down each frame!
-    // Actually, let's just do `addps xmm0, g_BoostVec` and trust that a lower ForwardSpeed (like 1.0 or 2.0) won't cause death.
-    // If 3.0 caused death, maybe the threshold is around there.
-    
+    // Add boost to xmm0 (safe addition)
     *p++ = 0x48; *p++ = 0xB8; // mov rax, &g_BoostVec
     *reinterpret_cast<uint64_t*>(p) = reinterpret_cast<uint64_t>(&g_BoostVec[0]); p += 8;
     
