@@ -12,7 +12,6 @@ static uint8_t* g_trampoline = nullptr;
 static uint8_t* g_patchAddr  = nullptr;
 
 alignas(16) static float g_BoostVec[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
-alignas(16) static float g_TempVector[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
 static volatile int32_t g_BoostActive = 0;
 
 static uintptr_t g_rbxBuffer[1024];
@@ -25,6 +24,16 @@ static int g_ForwardKey = VK_LSHIFT;
 static float g_AscendSpeed = 4.0f;
 static float g_DescendSpeed = -4.0f;
 static float g_ForwardSpeed = 10.0f; 
+
+static void WriteLog(const char* msg) {
+    HANDLE h = CreateFileA("CDFlight_Context.log", FILE_APPEND_DATA, FILE_SHARE_READ,
+        nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return;
+    DWORD wrote = 0;
+    WriteFile(h, msg, (DWORD)strlen(msg), &wrote, nullptr);
+    WriteFile(h, "\r\n", 2, &wrote, nullptr);
+    CloseHandle(h);
+}
 
 static bool IsGameForeground() {
     HWND hwnd = GetForegroundWindow();
@@ -188,7 +197,7 @@ static bool InstallPatch() {
     uint8_t* p = g_trampoline;
 
     // --- RING BUFFER CAPTURE ---
-    *p++ = 0x9C; // pushfq (ОЧЕНЬ ВАЖНО: сохраняем флаги процессора!)
+    *p++ = 0x9C; // pushfq
     *p++ = 0x50; // push rax
     *p++ = 0x51; // push rcx
     *p++ = 0x52; // push rdx
@@ -205,42 +214,43 @@ static bool InstallPatch() {
     *reinterpret_cast<uint64_t*>(p) = reinterpret_cast<uint64_t>(&g_rbxBuffer[0]); p += 8;
     *p++ = 0x48; *p++ = 0x89; *p++ = 0x1C; *p++ = 0xD0; // mov [rax + rdx*8], rbx
 
-    // --- XMM0 SAFE OVERWRITE ---
-    // Check if boost is active
+    *p++ = 0x5A; // pop rdx
+    *p++ = 0x59; // pop rcx
+    *p++ = 0x58; // pop rax
+    *p++ = 0x9D; // popfq
+    // --- END RING BUFFER ---
+
+    // Original instruction FIRST: movups [r13], xmm0
+    // This allows the engine to write the delta position naturally!
+    *p++ = 0x41; *p++ = 0x0F; *p++ = 0x11; *p++ = 0x45; *p++ = 0x00;
+
+    // NOW WE CHECK IF WE NEED TO OVERRIDE THE NEWLY WRITTEN POSITION!
+    // This completely bypasses modifying xmm0 and destroying flags or other math.
+    *p++ = 0x9C; // pushfq
+    *p++ = 0x50; // push rax
+
     *p++ = 0x48; *p++ = 0xB8; // mov rax, &g_BoostActive
     *reinterpret_cast<uint64_t*>(p) = reinterpret_cast<uint64_t>(&g_BoostActive); p += 8;
     
     *p++ = 0x83; *p++ = 0x38; *p++ = 0x00; // cmp dword ptr [rax], 0
-    *p++ = 0x74; *p++ = 0x22; // je skip (34 bytes forward)
+    *p++ = 0x74; *p++ = 0x16; // je skip (22 bytes forward)
 
-    // Save xmm0 to g_TempVector
-    *p++ = 0x48; *p++ = 0xB8; // mov rax, &g_TempVector
-    *reinterpret_cast<uint64_t*>(p) = reinterpret_cast<uint64_t>(&g_TempVector[0]); p += 8;
-    *p++ = 0x0F; *p++ = 0x11; *p++ = 0x00; // movups [rax], xmm0
+    // Load original newly written XYZW from [r13] to xmm0
+    *p++ = 0x41; *p++ = 0x0F; *p++ = 0x10; *p++ = 0x45; *p++ = 0x00; // movups xmm0, [r13]
 
-    // Load g_BoostVec
-    *p++ = 0x48; *p++ = 0xB9; // mov rcx, &g_BoostVec
+    // Load boost vector
+    *p++ = 0x48; *p++ = 0xB8; // mov rax, &g_BoostVec
     *reinterpret_cast<uint64_t*>(p) = reinterpret_cast<uint64_t>(&g_BoostVec[0]); p += 8;
 
-    // Copy X, Y (8 bytes)
-    *p++ = 0x48; *p++ = 0x8B; *p++ = 0x11; // mov rdx, [rcx]
-    *p++ = 0x48; *p++ = 0x89; *p++ = 0x10; // mov [rax], rdx
+    // ADD the boost directly to the position delta! (Safe addps, W is 0.0 so W remains unchanged)
+    *p++ = 0x0F; *p++ = 0x58; *p++ = 0x00; // addps xmm0, [rax]
 
-    // Copy Z (4 bytes)
-    *p++ = 0x8B; *p++ = 0x51; *p++ = 0x08; // mov edx, [rcx + 8]
-    *p++ = 0x89; *p++ = 0x50; *p++ = 0x08; // mov [rax + 8], edx
-
-    // Restore xmm0 from g_TempVector
-    *p++ = 0x0F; *p++ = 0x10; *p++ = 0x00; // movups xmm0, [rax]
+    // Write the boosted position back to [r13]
+    *p++ = 0x41; *p++ = 0x0F; *p++ = 0x11; *p++ = 0x45; *p++ = 0x00; // movups [r13], xmm0
 
     // skip:
-    *p++ = 0x5A; // pop rdx
-    *p++ = 0x59; // pop rcx
     *p++ = 0x58; // pop rax
-    *p++ = 0x9D; // popfq (ОЧЕНЬ ВАЖНО: восстанавливаем флаги!)
-
-    // Original instruction: movups [r13], xmm0
-    *p++ = 0x41; *p++ = 0x0F; *p++ = 0x11; *p++ = 0x45; *p++ = 0x00;
+    *p++ = 0x9D; // popfq
 
     // Jump back
     *p++ = 0xE9; // jmp rel32
@@ -260,6 +270,7 @@ static bool InstallPatch() {
 BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID reserved) {
     if (reason == DLL_PROCESS_ATTACH) {
         DisableThreadLibraryCalls(hModule);
+        DeleteFileA("CDFlight_Context.log");
         LoadConfig();
         CreateThread(nullptr, 0, KeyPollThread, nullptr, 0, nullptr);
         InstallPatch();
