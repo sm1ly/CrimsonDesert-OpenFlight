@@ -15,9 +15,11 @@ alignas(16) static float g_AddVec[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
 static int g_AscendKey = VK_NUMPAD9;
 static int g_DescendKey = VK_NUMPAD8;
 static int g_ForwardKey = VK_LSHIFT;
-static float g_AscendMultiplier = 2.0f;    // Ускорение взлета (дельта Y * это)
-static float g_DescendMultiplier = -1.5f;  // Ускорение падения (мягче, чтобы не улетать под текстуры)
-static float g_ForwardMultiplier = 4.0f;   // Ускорение вперед (понижено с 8.0 для безопасности)
+
+// Настройки скоростей
+static float g_AscendSpeed = 2.0f;     // Аддитивная дельта высоты
+static float g_DescendSpeed = -2.0f;   // Аддитивная дельта падения
+static float g_ForwardMultiplier = 4.0f; // Множитель скорости вперед
 
 static bool g_HookInstalled = false;
 
@@ -54,10 +56,10 @@ static void LoadConfig() {
     
     char buf[32];
     GetPrivateProfileStringA("Settings", "AscendSpeed", "2.0", buf, sizeof(buf), iniPath.c_str());
-    g_AscendMultiplier = std::stof(buf);
+    g_AscendSpeed = std::stof(buf);
     
-    GetPrivateProfileStringA("Settings", "DescendSpeed", "-1.5", buf, sizeof(buf), iniPath.c_str());
-    g_DescendMultiplier = std::stof(buf);
+    GetPrivateProfileStringA("Settings", "DescendSpeed", "-2.0", buf, sizeof(buf), iniPath.c_str());
+    g_DescendSpeed = std::stof(buf);
 
     GetPrivateProfileStringA("Settings", "ForwardSpeed", "4.0", buf, sizeof(buf), iniPath.c_str());
     g_ForwardMultiplier = std::stof(buf);
@@ -73,22 +75,20 @@ static uint8_t* FindHookAddress() {
     uint8_t* base = (uint8_t*)hGame;
 
     // Ищем железный паттерн: addps xmm0, [r13]; movups [r13], xmm0
-    // Это финальное сложение и запись. Мы отсчитаем от него НАЗАД 8 байт, чтобы найти movaps.
     const uint8_t pattern[] = { 
-        0x41, 0x0F, 0x58, 0x45, 0x00, // addps xmm0, xmmword ptr [r13+0]
-        0x41, 0x0F, 0x11, 0x45, 0x00  // movups xmmword ptr [r13+0], xmm0
+        0x41, 0x0F, 0x58, 0x45, 0x00, 
+        0x41, 0x0F, 0x11, 0x45, 0x00  
     };
-    const char* mask = "xxxxx+xxxx+"; // '+' значит точное совпадение, но мы юзаем 'x'
     
     for (DWORD i = 0; i < size - 10; i++) {
         if (base[i] == 0x41 && base[i+1] == 0x0F && base[i+2] == 0x58 && base[i+3] == 0x45 && base[i+4] == 0x00 &&
             base[i+5] == 0x41 && base[i+6] == 0x0F && base[i+7] == 0x11 && base[i+8] == 0x45 && base[i+9] == 0x00) {
             
-            // Нашли! Теперь проверяем, что за 8 байт ДО этого лежит 'movaps xmm0, xmm6; subss xmm9, xmm8'
+            // Нашли! Отступаем 8 байт назад: movaps xmm0, xmm6; subss xmm9, xmm8
             uint8_t* target = base + i - 8;
             if (target[0] == 0x0F && target[1] == 0x28 && target[2] == 0xC6 &&
                 target[3] == 0xF3 && target[4] == 0x45 && target[5] == 0x0F && target[6] == 0x5C && target[7] == 0xC8) {
-                return target; // Это идеальная точка для хука (movaps)
+                return target;
             }
         }
     }
@@ -125,31 +125,25 @@ static bool InstallPatch() {
     uint8_t* p = g_trampoline;
 
     // --- DELTA MULTIPLIER HOOK ---
-    // Оригинальные 8 байт:
     *p++ = 0x0F; *p++ = 0x28; *p++ = 0xC6;                         // movaps xmm0, xmm6
     *p++ = 0xF3; *p++ = 0x45; *p++ = 0x0F; *p++ = 0x5C; *p++ = 0xC8; // subss xmm9, xmm8
     
     *p++ = 0x50; // push rax
 
-    // Умножаем ВЕСЬ вектор X,Y,Z (дельта скорости) на g_MultiplierVec
-    // Это позволяет безопасно ускоряться вперед и вверх/вниз без телепортов
     *p++ = 0x48; *p++ = 0xB8; // mov rax, &g_MultiplierVec
     *reinterpret_cast<uint64_t*>(p) = reinterpret_cast<uint64_t>(&g_MultiplierVec[0]); p += 8;
     *p++ = 0x0F; *p++ = 0x59; *p++ = 0x00; // mulps xmm0, [rax]
 
-    // Аддитивная страховка (если нужно просто подтолкнуть чуть вверх при нулевой дельте Y)
     *p++ = 0x48; *p++ = 0xB8; // mov rax, &g_AddVec
     *reinterpret_cast<uint64_t*>(p) = reinterpret_cast<uint64_t>(&g_AddVec[0]); p += 8;
     *p++ = 0x0F; *p++ = 0x58; *p++ = 0x00; // addps xmm0, [rax]
 
     *p++ = 0x58; // pop rax
 
-    // Прыжок обратно к: addps xmm0, [r13]
     *p++ = 0xE9; // jmp rel32
     int32_t relBack = static_cast<int32_t>((g_patchAddr + 8) - (p + 4));
     *reinterpret_cast<int32_t*>(p) = relBack;
 
-    // --- INJECT JUMP ---
     DWORD oldProt;
     VirtualProtect(g_patchAddr, 8, PAGE_EXECUTE_READWRITE, &oldProt);
     g_patchAddr[0] = 0xE9; // jmp
@@ -168,7 +162,6 @@ static bool InstallPatch() {
 }
 
 static DWORD WINAPI KeyPollThread(LPVOID) {
-    // Ждем, пока игра загрузится в память (в обход пакеров/шифрования)
     while (!g_HookInstalled) {
         if (IsGameForeground()) {
             InstallPatch();
@@ -188,13 +181,15 @@ static DWORD WINAPI KeyPollThread(LPVOID) {
                 g_MultiplierVec[2] = 1.0f;
             }
 
-            // Y (Вертикальное перемещение)
+            // Y (Вертикальное перемещение - ЖЕЛЕЗНАЯ ДЕЛЬТА)
+            // Мы больше не множим Y, мы всегда прибавляем константную дельту.
+            // Это решает проблему Shift+Num9 (когда Y-вектор был 0, умножение давало 0).
             if (GetAsyncKeyState(g_AscendKey) & 0x8000) {
-                g_MultiplierVec[1] = g_AscendMultiplier; // Умножаем дельту Y вверх
-                g_AddVec[1] = 0.5f; // Легкий пинок, если дельта была нулевой
+                g_MultiplierVec[1] = 1.0f; 
+                g_AddVec[1] = g_AscendSpeed; 
             } else if (GetAsyncKeyState(g_DescendKey) & 0x8000) {
-                g_MultiplierVec[1] = g_DescendMultiplier; // Умножаем дельту Y вниз (отрицательно)
-                g_AddVec[1] = -0.5f; // Пинок вниз
+                g_MultiplierVec[1] = 1.0f;
+                g_AddVec[1] = g_DescendSpeed;
             } else {
                 g_MultiplierVec[1] = 1.0f;
                 g_AddVec[1] = 0.0f;
@@ -215,7 +210,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID reserved) {
     if (reason == DLL_PROCESS_ATTACH) {
         DisableThreadLibraryCalls(hModule);
         DeleteFileA("CDFlight_Context.log");
-        WriteLog("--- CDFlight Open Source v6.0 (Delayed AOB + Safe Y-Multiplier Edition) ---");
+        WriteLog("--- CDFlight Open Source v7.0 (Simultaneous Flight Edition) ---");
         LoadConfig();
         CreateThread(nullptr, 0, KeyPollThread, nullptr, 0, nullptr);
     }
