@@ -16,10 +16,10 @@ static int g_AscendKey = VK_NUMPAD9;
 static int g_DescendKey = VK_NUMPAD8;
 static int g_ForwardKey = VK_LSHIFT;
 
-// Настройки скоростей
-static float g_AscendSpeed = 2.0f;     // Аддитивная дельта высоты
-static float g_DescendSpeed = -2.0f;   // Аддитивная дельта падения
-static float g_ForwardMultiplier = 4.0f; // Множитель скорости вперед
+// Настройки скоростей (ИНИ)
+static float g_AscendSpeed = 5.0f;     
+static float g_DescendSpeed = -5.0f;   
+static float g_ForwardMultiplier = 4.0f; 
 
 static bool g_HookInstalled = false;
 
@@ -50,19 +50,35 @@ static void LoadConfig() {
         iniPath = iniPath.substr(0, pos) + "\\CDFlight.ini";
     }
 
-    g_AscendKey = GetPrivateProfileIntA("Settings", "AscendKey", VK_NUMPAD9, iniPath.c_str());
-    g_DescendKey = GetPrivateProfileIntA("Settings", "DescendKey", VK_NUMPAD8, iniPath.c_str());
-    g_ForwardKey = GetPrivateProfileIntA("Settings", "ForwardKey", VK_LSHIFT, iniPath.c_str());
+    // Если INI файла нет - создаем его с дефолтными значениями
+    if (GetFileAttributesA(iniPath.c_str()) == INVALID_FILE_ATTRIBUTES) {
+        WritePrivateProfileStringA("Settings", "AscendKey", "105", iniPath.c_str());   // Numpad 9
+        WritePrivateProfileStringA("Settings", "DescendKey", "104", iniPath.c_str());  // Numpad 8
+        WritePrivateProfileStringA("Settings", "ForwardKey", "16", iniPath.c_str());   // Shift
+        WritePrivateProfileStringA("Settings", "AscendSpeed", "5.0", iniPath.c_str());
+        WritePrivateProfileStringA("Settings", "DescendSpeed", "-5.0", iniPath.c_str());
+        WritePrivateProfileStringA("Settings", "ForwardSpeed", "4.0", iniPath.c_str());
+        WriteLog("Created default CDFlight.ini");
+    }
+
+    g_AscendKey = GetPrivateProfileIntA("Settings", "AscendKey", 105, iniPath.c_str());
+    g_DescendKey = GetPrivateProfileIntA("Settings", "DescendKey", 104, iniPath.c_str());
+    g_ForwardKey = GetPrivateProfileIntA("Settings", "ForwardKey", 16, iniPath.c_str());
     
     char buf[32];
-    GetPrivateProfileStringA("Settings", "AscendSpeed", "2.0", buf, sizeof(buf), iniPath.c_str());
+    GetPrivateProfileStringA("Settings", "AscendSpeed", "5.0", buf, sizeof(buf), iniPath.c_str());
     g_AscendSpeed = std::stof(buf);
     
-    GetPrivateProfileStringA("Settings", "DescendSpeed", "-2.0", buf, sizeof(buf), iniPath.c_str());
+    GetPrivateProfileStringA("Settings", "DescendSpeed", "-5.0", buf, sizeof(buf), iniPath.c_str());
     g_DescendSpeed = std::stof(buf);
 
     GetPrivateProfileStringA("Settings", "ForwardSpeed", "4.0", buf, sizeof(buf), iniPath.c_str());
     g_ForwardMultiplier = std::stof(buf);
+
+    char logBuf[256];
+    sprintf_s(logBuf, "Config loaded: Fwd=%.1f, Asc=%.1f, Dsc=%.1f (INI Path: %s)", 
+              g_ForwardMultiplier, g_AscendSpeed, g_DescendSpeed, iniPath.c_str());
+    WriteLog(logBuf);
 }
 
 static uint8_t* FindHookAddress() {
@@ -74,7 +90,6 @@ static uint8_t* FindHookAddress() {
     DWORD size = nt->OptionalHeader.SizeOfImage;
     uint8_t* base = (uint8_t*)hGame;
 
-    // Ищем железный паттерн: addps xmm0, [r13]; movups [r13], xmm0
     const uint8_t pattern[] = { 
         0x41, 0x0F, 0x58, 0x45, 0x00, 
         0x41, 0x0F, 0x11, 0x45, 0x00  
@@ -84,7 +99,6 @@ static uint8_t* FindHookAddress() {
         if (base[i] == 0x41 && base[i+1] == 0x0F && base[i+2] == 0x58 && base[i+3] == 0x45 && base[i+4] == 0x00 &&
             base[i+5] == 0x41 && base[i+6] == 0x0F && base[i+7] == 0x11 && base[i+8] == 0x45 && base[i+9] == 0x00) {
             
-            // Нашли! Отступаем 8 байт назад: movaps xmm0, xmm6; subss xmm9, xmm8
             uint8_t* target = base + i - 8;
             if (target[0] == 0x0F && target[1] == 0x28 && target[2] == 0xC6 &&
                 target[3] == 0xF3 && target[4] == 0x45 && target[5] == 0x0F && target[6] == 0x5C && target[7] == 0xC8) {
@@ -99,12 +113,12 @@ static bool InstallPatch() {
     g_patchAddr = FindHookAddress();
     
     if (!g_patchAddr) {
-        WriteLog("ERROR: AOB Scan failed! Could not find physics DELTA instruction in memory.");
+        WriteLog("ERROR: AOB Scan failed! Could not find physics DELTA instruction.");
         return false;
     }
 
     char buf[256];
-    sprintf_s(buf, "SUCCESS: AOB Scanner found hook DELTA address at %p", g_patchAddr);
+    sprintf_s(buf, "SUCCESS: Hook DELTA address found at %p", g_patchAddr);
     WriteLog(buf);
 
     uintptr_t base = reinterpret_cast<uintptr_t>(g_patchAddr) & ~static_cast<uintptr_t>(0xFFFF);
@@ -117,62 +131,55 @@ static bool InstallPatch() {
         if (lo) { g_trampoline = (uint8_t*)lo; break; }
     }
     
-    if (!g_trampoline) {
-        WriteLog("ERROR: Failed to allocate trampoline memory.");
-        return false;
-    }
+    if (!g_trampoline) return false;
 
     uint8_t* p = g_trampoline;
 
-    // --- DELTA MULTIPLIER HOOK ---
-    *p++ = 0x0F; *p++ = 0x28; *p++ = 0xC6;                         // movaps xmm0, xmm6
-    *p++ = 0xF3; *p++ = 0x45; *p++ = 0x0F; *p++ = 0x5C; *p++ = 0xC8; // subss xmm9, xmm8
+    *p++ = 0x0F; *p++ = 0x28; *p++ = 0xC6;                         
+    *p++ = 0xF3; *p++ = 0x45; *p++ = 0x0F; *p++ = 0x5C; *p++ = 0xC8; 
     
-    *p++ = 0x50; // push rax
+    *p++ = 0x50; 
 
-    *p++ = 0x48; *p++ = 0xB8; // mov rax, &g_MultiplierVec
+    *p++ = 0x48; *p++ = 0xB8; 
     *reinterpret_cast<uint64_t*>(p) = reinterpret_cast<uint64_t>(&g_MultiplierVec[0]); p += 8;
-    *p++ = 0x0F; *p++ = 0x59; *p++ = 0x00; // mulps xmm0, [rax]
+    *p++ = 0x0F; *p++ = 0x59; *p++ = 0x00; 
 
-    *p++ = 0x48; *p++ = 0xB8; // mov rax, &g_AddVec
+    *p++ = 0x48; *p++ = 0xB8; 
     *reinterpret_cast<uint64_t*>(p) = reinterpret_cast<uint64_t>(&g_AddVec[0]); p += 8;
-    *p++ = 0x0F; *p++ = 0x58; *p++ = 0x00; // addps xmm0, [rax]
+    *p++ = 0x0F; *p++ = 0x58; *p++ = 0x00; 
 
-    *p++ = 0x58; // pop rax
+    *p++ = 0x58; 
 
-    *p++ = 0xE9; // jmp rel32
+    *p++ = 0xE9; 
     int32_t relBack = static_cast<int32_t>((g_patchAddr + 8) - (p + 4));
     *reinterpret_cast<int32_t*>(p) = relBack;
 
     DWORD oldProt;
     VirtualProtect(g_patchAddr, 8, PAGE_EXECUTE_READWRITE, &oldProt);
-    g_patchAddr[0] = 0xE9; // jmp
+    g_patchAddr[0] = 0xE9; 
     int32_t relFwd = static_cast<int32_t>(g_trampoline - (g_patchAddr + 5));
     *reinterpret_cast<int32_t*>(g_patchAddr + 1) = relFwd;
     
-    g_patchAddr[5] = 0x90; // nop
-    g_patchAddr[6] = 0x90; // nop
-    g_patchAddr[7] = 0x90; // nop
+    g_patchAddr[5] = 0x90; 
+    g_patchAddr[6] = 0x90; 
+    g_patchAddr[7] = 0x90; 
     
     VirtualProtect(g_patchAddr, 8, oldProt, &oldProt);
 
-    WriteLog("SUCCESS: Trampoline hook installed completely on DELTA point.");
     g_HookInstalled = true;
     return true;
 }
 
 static DWORD WINAPI KeyPollThread(LPVOID) {
     while (!g_HookInstalled) {
-        if (IsGameForeground()) {
-            InstallPatch();
-        }
+        if (IsGameForeground()) InstallPatch();
         Sleep(1000);
     }
 
     while (true) {
         if (IsGameForeground()) {
             
-            // X и Z (Горизонтальное перемещение)
+            // --- ГОРИЗОНТАЛЬ (Shift) ---
             if (GetAsyncKeyState(g_ForwardKey) & 0x8000) {
                 g_MultiplierVec[0] = g_ForwardMultiplier; // X
                 g_MultiplierVec[2] = g_ForwardMultiplier; // Z
@@ -181,17 +188,19 @@ static DWORD WINAPI KeyPollThread(LPVOID) {
                 g_MultiplierVec[2] = 1.0f;
             }
 
-            // Y (Вертикальное перемещение - ЖЕЛЕЗНАЯ ДЕЛЬТА)
-            // Мы больше не множим Y, мы всегда прибавляем константную дельту.
-            // Это решает проблему Shift+Num9 (когда Y-вектор был 0, умножение давало 0).
+            // --- ВЕРТИКАЛЬ (Взлет / Спуск) ---
+            // ГЕНИАЛЬНЫЙ МУВ: если мы хотим лететь вверх/вниз, 
+            // мы ставим множитель Y в 0.0f (отключаем гравитацию)
+            // и прибавляем чистую скорость полета!
             if (GetAsyncKeyState(g_AscendKey) & 0x8000) {
-                g_MultiplierVec[1] = 1.0f; 
-                g_AddVec[1] = g_AscendSpeed; 
+                g_MultiplierVec[1] = 0.0f; // Отключаем гравитацию
+                g_AddVec[1] = g_AscendSpeed; // Летим четко вверх
             } else if (GetAsyncKeyState(g_DescendKey) & 0x8000) {
-                g_MultiplierVec[1] = 1.0f;
-                g_AddVec[1] = g_DescendSpeed;
+                g_MultiplierVec[1] = 0.0f; // Отключаем гравитацию
+                g_AddVec[1] = g_DescendSpeed; // Летим четко вниз
             } else {
-                g_MultiplierVec[1] = 1.0f;
+                // Ничего не нажато - возвращаем обычную физику
+                g_MultiplierVec[1] = 1.0f; 
                 g_AddVec[1] = 0.0f;
             }
 
@@ -210,7 +219,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID reserved) {
     if (reason == DLL_PROCESS_ATTACH) {
         DisableThreadLibraryCalls(hModule);
         DeleteFileA("CDFlight_Context.log");
-        WriteLog("--- CDFlight Open Source v7.0 (Simultaneous Flight Edition) ---");
+        WriteLog("--- CDFlight Open Source v8.0 (Anti-Gravity Edition) ---");
         LoadConfig();
         CreateThread(nullptr, 0, KeyPollThread, nullptr, 0, nullptr);
     }
