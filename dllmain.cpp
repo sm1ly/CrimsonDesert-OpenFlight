@@ -1,3 +1,8 @@
+// CDFlight v8.18
+// Open Source Flight Mod for Crimson Desert
+// Core AOB & Inline Assembly Logic by sm1ly/Middle
+// Smooth Ramping Physics concept adapted from EnhancedFlight by Bambozu
+
 #define _CRT_SECURE_NO_WARNINGS
 #include "pch.h"
 #include <windows.h>
