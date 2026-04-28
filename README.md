@@ -5,7 +5,7 @@ Built and tested for **v1.04.02**.
 Unlike closed-source alternatives, this mod is fully open, lightweight, and intercepts physics velocity updates securely at the SSE instruction level via a trampoline hook.
 
 ## Features
-- **Smooth Ramping Physics**: Implements linear time-based ramp-up/down logic to gracefully apply velocity changes, eliminating wall collision bounce. *(Credit to [Bambozu](https://github.com/Bambozu) for the original smoothing math concept from EnhancedFlight!)*
+- **Smooth Ramping Physics**: Implements linear time-based ramp-up/down logic to gracefully apply velocity changes, eliminating wall collision bounce. *(Credit to [Bambozu](https://github.com/Ronibuilds/CrimsonDesertMods) for the original smoothing math concept from EnhancedFlight!)*
 - **Safe Delta Manipulation**: Intercepts the pure positional delta (`movaps xmm0, xmm6`) instead of absolute world coordinates. This completely eliminates collision deaths and physics glitches.
 - **Delayed AOB Scanner**: Hook installs safely after the game unpacks in memory, ensuring maximum compatibility with ASI loaders.
 - **Branchless Math**: Operates directly on SSE registers (`mulps`, `addps`) without stack/flag clobbering or branching logic, ensuring buttery smooth frame rates.
