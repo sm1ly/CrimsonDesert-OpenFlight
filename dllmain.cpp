@@ -18,6 +18,13 @@ static float g_AscendSpeed = 5.0f;
 static float g_DescendSpeed = -5.0f;   
 static float g_ForwardMultiplier = 8.0f; 
 
+static float g_AscendRampUpMs = 300.0f;
+static float g_AscendRampDownMs = 200.0f;
+static float g_DescendRampUpMs = 300.0f;
+static float g_DescendRampDownMs = 200.0f;
+static float g_ForwardRampUpMs = 500.0f;
+static float g_ForwardRampDownMs = 300.0f;
+
 static bool g_HookInstalled = false;
 
 struct SharedData {
@@ -63,6 +70,12 @@ static void LoadConfig() {
         WritePrivateProfileStringA("Settings", "AscendSpeed", "5.0", iniPath.c_str());
         WritePrivateProfileStringA("Settings", "DescendSpeed", "-5.0", iniPath.c_str());
         WritePrivateProfileStringA("Settings", "ForwardSpeed", "8.0", iniPath.c_str());
+        WritePrivateProfileStringA("Settings", "AscendRampUpMs", "300.0", iniPath.c_str());
+        WritePrivateProfileStringA("Settings", "AscendRampDownMs", "200.0", iniPath.c_str());
+        WritePrivateProfileStringA("Settings", "DescendRampUpMs", "300.0", iniPath.c_str());
+        WritePrivateProfileStringA("Settings", "DescendRampDownMs", "200.0", iniPath.c_str());
+        WritePrivateProfileStringA("Settings", "ForwardRampUpMs", "500.0", iniPath.c_str());
+        WritePrivateProfileStringA("Settings", "ForwardRampDownMs", "300.0", iniPath.c_str());
     }
 
     g_AscendKey = GetPrivateProfileIntA("Settings", "AscendKey", 105, iniPath.c_str());
@@ -78,6 +91,21 @@ static void LoadConfig() {
 
     GetPrivateProfileStringA("Settings", "ForwardSpeed", "8.0", buf, sizeof(buf), iniPath.c_str());
     g_ForwardMultiplier = std::stof(buf);
+
+    GetPrivateProfileStringA("Settings", "AscendRampUpMs", "300.0", buf, sizeof(buf), iniPath.c_str());
+    g_AscendRampUpMs = std::stof(buf);
+    GetPrivateProfileStringA("Settings", "AscendRampDownMs", "200.0", buf, sizeof(buf), iniPath.c_str());
+    g_AscendRampDownMs = std::stof(buf);
+
+    GetPrivateProfileStringA("Settings", "DescendRampUpMs", "300.0", buf, sizeof(buf), iniPath.c_str());
+    g_DescendRampUpMs = std::stof(buf);
+    GetPrivateProfileStringA("Settings", "DescendRampDownMs", "200.0", buf, sizeof(buf), iniPath.c_str());
+    g_DescendRampDownMs = std::stof(buf);
+
+    GetPrivateProfileStringA("Settings", "ForwardRampUpMs", "500.0", buf, sizeof(buf), iniPath.c_str());
+    g_ForwardRampUpMs = std::stof(buf);
+    GetPrivateProfileStringA("Settings", "ForwardRampDownMs", "300.0", buf, sizeof(buf), iniPath.c_str());
+    g_ForwardRampDownMs = std::stof(buf);
 
     char logBuf[256];
     sprintf_s(logBuf, "Config loaded: Fwd=%.1f, Asc=%.1f, Dsc=%.1f (INI Path: %s)", 
@@ -193,34 +221,66 @@ static DWORD WINAPI KeyPollThread(LPVOID) {
         Sleep(1000);
     }
 
+    ULONGLONG lastTime = GetTickCount64();
+
+    float currentForward = 0.0f;
+    float currentAscend = 0.0f;
+    float currentDescend = 0.0f;
+
     while (true) {
+        ULONGLONG now = GetTickCount64();
+        float dt = (float)(now - lastTime);
+        lastTime = now;
+        
+        if (dt > 100.0f) dt = 100.0f; // Prevent huge jumps if thread stalled
+
         if (IsGameForeground() && g_Shared) {
             
-            if (GetAsyncKeyState(g_ForwardKey) & 0x8000) {
-                // Return exactly to 8.12 logic (which moved you forward, but jump filter now active)
-                // We use Row 3 of the matrix (0x80, 0x88) which is Forward
-                // Multiply by 0.1f to smooth it out (so it doesn't bounce off walls).
-                // If 0.1 is too slow, we can just use ForwardMultiplier directly.
-                // In 8.12 I used (-g_ForwardMultiplier) and he said "он дергается и долбится об стенку. а теперь он даже в прыжке тебя передвигает вперед".
-                // Since I filtered jump, the wall bouncing is the only issue.
-                // I will use (-g_ForwardMultiplier * 0.05f) so it's smooth.
-                // If the user has 20.0 in INI, 20.0 * 0.05 = 1.0f added per frame (60 units/sec).
-                g_AddVec[0] = g_Shared->ForwardX * (-g_ForwardMultiplier * 0.05f);
-                g_AddVec[2] = g_Shared->ForwardZ * (-g_ForwardMultiplier * 0.05f);
-            } else {
-                g_AddVec[0] = 0.0f;
-                g_AddVec[2] = 0.0f;
+            // Forward Ramp
+            bool fwdDown = (GetAsyncKeyState(g_ForwardKey) & 0x8000) != 0;
+            float targetForward = fwdDown ? g_ForwardMultiplier : 0.0f;
+            
+            if (currentForward < targetForward) {
+                currentForward += g_ForwardMultiplier * (dt / g_ForwardRampUpMs);
+                if (currentForward > targetForward) currentForward = targetForward;
+            } else if (currentForward > targetForward) {
+                currentForward -= g_ForwardMultiplier * (dt / g_ForwardRampDownMs);
+                if (currentForward < targetForward) currentForward = targetForward;
             }
 
-            if (GetAsyncKeyState(g_AscendKey) & 0x8000) {
-                g_AddVec[1] = g_AscendSpeed; 
-            } else if (GetAsyncKeyState(g_DescendKey) & 0x8000) {
-                g_AddVec[1] = g_DescendSpeed; 
-            } else {
-                g_AddVec[1] = 0.0f;
+            g_AddVec[0] = g_Shared->ForwardX * (-currentForward * 0.05f);
+            g_AddVec[2] = g_Shared->ForwardZ * (-currentForward * 0.05f);
+
+            // Ascend Ramp
+            bool ascDown = (GetAsyncKeyState(g_AscendKey) & 0x8000) != 0;
+            float targetAscend = ascDown ? g_AscendSpeed : 0.0f;
+            
+            if (currentAscend < targetAscend) {
+                currentAscend += g_AscendSpeed * (dt / g_AscendRampUpMs);
+                if (currentAscend > targetAscend) currentAscend = targetAscend;
+            } else if (currentAscend > targetAscend) {
+                currentAscend -= g_AscendSpeed * (dt / g_AscendRampDownMs);
+                if (currentAscend < targetAscend) currentAscend = targetAscend;
             }
+
+            // Descend Ramp (g_DescendSpeed is negative)
+            bool descDown = (GetAsyncKeyState(g_DescendKey) & 0x8000) != 0;
+            float targetDescend = descDown ? g_DescendSpeed : 0.0f;
+            
+            if (currentDescend > targetDescend) { // going more negative
+                currentDescend += g_DescendSpeed * (dt / g_DescendRampUpMs);
+                if (currentDescend < targetDescend) currentDescend = targetDescend;
+            } else if (currentDescend < targetDescend) { // going back to 0
+                currentDescend -= g_DescendSpeed * (dt / g_DescendRampDownMs); 
+                if (currentDescend > targetDescend) currentDescend = targetDescend;
+            }
+
+            g_AddVec[1] = currentAscend + currentDescend;
             
         } else {
+            currentForward = 0.0f;
+            currentAscend = 0.0f;
+            currentDescend = 0.0f;
             g_AddVec[0] = 0.0f;
             g_AddVec[1] = 0.0f;
             g_AddVec[2] = 0.0f;
@@ -234,7 +294,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID reserved) {
     if (reason == DLL_PROCESS_ATTACH) {
         DisableThreadLibraryCalls(hModule);
         DeleteFileA("CDFlight_Context.log");
-        WriteLog("--- CDFlight Open Source v8.17 (Safe Engine Delta) ---");
+        WriteLog("--- CDFlight Open Source v8.18 (Smooth Ramping Physics) ---");
         LoadConfig();
         CreateThread(nullptr, 0, KeyPollThread, nullptr, 0, nullptr);
     }
